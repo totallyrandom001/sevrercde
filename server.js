@@ -6,9 +6,18 @@ const PORT = process.env.PORT || 3000;
 
 const MAX_MESSAGE_CHARS = 20000;
 const MAX_IMAGE_BASE64_CHARS = 1500000;
+const DELETE_PASSWORD = "sixseven";
 
-app.use(cors());
-app.options('*', cors());
+// Enable CORS with 2-hour preflight caching
+const corsOptions = {
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type'],
+  maxAge: 7200
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(express.json({ limit: '5mb' }));
 
 let clients = [];
@@ -68,6 +77,7 @@ setInterval(() => {
   });
 }, 20000);
 
+// Health check endpoint
 app.get('/', (req, res) => {
   res.json({ status: "ok", message: "Server is running!" });
 });
@@ -77,7 +87,7 @@ app.get('/api/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no'); // Prevents Render proxy from buffering SSE messages
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
   clients.push(res);
@@ -85,6 +95,32 @@ app.get('/api/stream', (req, res) => {
   req.on('close', () => {
     clients = clients.filter(client => client !== res);
   });
+});
+
+// GET or POST /api/delete?password=sixseven
+app.all('/api/delete', async (req, res, next) => {
+  try {
+    const password = req.query.password || (req.body && req.body.password);
+
+    if (password !== DELETE_PASSWORD) {
+      return res.status(403).json({ error: "Yanlış şifre." });
+    }
+
+    // 15 minutes ago in milliseconds
+    const fifteenMinsAgo = Date.now() - (15 * 60 * 1000);
+
+    await queryD1(
+      "DELETE FROM messages WHERE created_at < ?",
+      [fifteenMinsAgo]
+    );
+
+    return res.json({ 
+      ok: true, 
+      message: "15 dakikadan eski tüm mesajlar silindi." 
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // POST /api/send
@@ -103,7 +139,6 @@ app.post('/api/send', async (req, res, next) => {
 
     const createdAt = Date.now();
     
-    // Save to D1 and capture generated last_row_id
     const { lastRowId } = await queryD1(
       "INSERT INTO messages (name, message, image, created_at) VALUES (?, ?, ?, ?)",
       [name, message, image, createdAt]
@@ -117,7 +152,6 @@ app.post('/api/send', async (req, res, next) => {
       created_at: createdAt
     };
 
-    // Push new message instantly with its valid ID
     broadcast(newMsg);
 
     return res.json({ ok: true });
@@ -126,7 +160,7 @@ app.post('/api/send', async (req, res, next) => {
   }
 });
 
-// GET /api/messages (Initial message history load)
+// GET /api/messages
 app.get('/api/messages', async (req, res, next) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || '50', 10) || 50, 200);
@@ -140,11 +174,13 @@ app.get('/api/messages', async (req, res, next) => {
   }
 });
 
+// Global Error Handler
 app.use((err, req, res, next) => {
   console.error("Server Error:", err.message);
   res.status(500).json({ error: err.message || "Sunucu hatası" });
 });
 
+// 404 Handler
 app.use((req, res) => {
   res.status(404).json({ error: "Route not found" });
 });
