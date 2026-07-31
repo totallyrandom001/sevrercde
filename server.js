@@ -4,7 +4,9 @@ const fetch = require("node-fetch");
 
 const app = express();
 
-app.use(express.json({ limit: "2mb" }));
+// Increase JSON body payload limit to allow Base64 image uploads
+app.use(express.json({ limit: "10mb" }));
+
 app.use(cors({
   origin: "*",
   methods: ["GET", "POST", "OPTIONS"],
@@ -60,7 +62,7 @@ async function authenticate(req, res, next) {
   }
 }
 
-// SSE Broadcast Engine
+// SSE Real-Time Stream Engine
 let sseClients = [];
 function broadcastPFrame(eventType, payload, targetUsernames = null) {
   const dataString = `data: ${JSON.stringify({ frameType: "P-FRAME", type: eventType, payload })}\n\n`;
@@ -73,7 +75,7 @@ function broadcastPFrame(eventType, payload, targetUsernames = null) {
 
 app.get("/", (req, res) => res.send("Chat Backend Online"));
 
-// SSE Stream Setup
+// SSE Stream Setup (Robust Query Logic for Friends & Groups)
 app.get("/api/stream", authenticate, async (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -83,14 +85,30 @@ app.get("/api/stream", authenticate, async (req, res) => {
   sseClients.push(client);
 
   try {
-    const groups = req.user.role === "admin"
-      ? (await queryWorker("SELECT * FROM groups")).results
-      : (await queryWorker("SELECT g.* FROM groups g JOIN group_members gm ON g.group_token = gm.group_token WHERE gm.username = ?", [req.user.username])).results;
+    // 1. Fetch Groups reliably
+    const groupsRes = req.user.role === "admin"
+      ? await queryWorker("SELECT * FROM groups")
+      : await queryWorker("SELECT g.* FROM groups g JOIN group_members gm ON g.group_token = gm.group_token WHERE gm.username = ?", [req.user.username]);
+    const groups = groupsRes.results || [];
 
-    const friends = (await queryWorker(
-      "SELECT f.*, u.pfp FROM friends f JOIN users u ON (u.username = CASE WHEN f.user1 = ? THEN f.user2 ELSE f.user1 END) WHERE f.user1 = ? OR f.user2 = ?",
-      [req.user.username, req.user.username, req.user.username]
-    )).results;
+    // 2. Fetch Friends reliably
+    const friendsRes = await queryWorker("SELECT * FROM friends WHERE user1 = ? OR user2 = ?", [req.user.username, req.user.username]);
+    const friendRows = friendsRes.results || [];
+
+    const usersRes = await queryWorker("SELECT username, pfp FROM users");
+    const userMap = {};
+    (usersRes.results || []).forEach(u => userMap[u.username] = u.pfp || "");
+
+    const friends = friendRows.map(f => {
+      const otherUser = f.user1 === req.user.username ? f.user2 : f.user1;
+      return {
+        id: f.id,
+        user1: f.user1,
+        user2: f.user2,
+        status: f.status,
+        pfp: userMap[otherUser] || ""
+      };
+    });
 
     res.write(`data: ${JSON.stringify({
       frameType: "I-FRAME",
@@ -107,7 +125,7 @@ app.get("/api/stream", authenticate, async (req, res) => {
   });
 });
 
-// Account Registration with Existing Account Prevention Check
+// User Account Registration
 app.post("/api/register", async (req, res) => {
   let { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: "Missing required fields" });
@@ -116,19 +134,16 @@ app.post("/api/register", async (req, res) => {
   if (!username) return res.status(400).json({ error: "Username must contain valid letters" });
 
   try {
-    // 1. Check if user already exists in registered accounts
     const existingUser = await queryWorker("SELECT username FROM users WHERE username = ?", [username]);
     if (existingUser.results && existingUser.results.length > 0) {
       return res.status(409).json({ error: "An account with this username already exists." });
     }
 
-    // 2. Check if user already exists in pending approval requests
     const existingPending = await queryWorker("SELECT username FROM pending_accounts WHERE username = ?", [username]);
     if (existingPending.results && existingPending.results.length > 0) {
-      return res.status(409).json({ error: "An account creation request for this username is already pending approval." });
+      return res.status(409).json({ error: "An account creation request for this username is pending approval." });
     }
 
-    // 3. Check max pending account limit (5)
     const countRes = await queryWorker("SELECT COUNT(*) as count FROM pending_accounts");
     if (countRes.results[0].count >= 5) {
       return res.status(429).json({ error: "Max 5 pending account requests reached. Try again later." });
@@ -137,9 +152,7 @@ app.post("/api/register", async (req, res) => {
     const token = generateToken(username, password);
     await queryWorker("INSERT INTO pending_accounts (username, password, token) VALUES (?, ?, ?)", [username, password, token]);
     res.json({ message: "Account creation request submitted for admin approval." });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post("/api/login", async (req, res) => {
@@ -154,7 +167,7 @@ app.post("/api/login", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Profile Picture Upload
+// Profile Picture Upload (Server-Side 512KB Limit Enforcement)
 app.post("/api/user/pfp", authenticate, async (req, res) => {
   const { pfpBase64 } = req.body;
   if (!pfpBase64) return res.status(400).json({ error: "No image provided" });
@@ -199,7 +212,7 @@ app.post("/api/friends/accept", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Group Creation & In-Group Member Management
+// Group & DM Management
 app.post("/api/groups/create", authenticate, async (req, res) => {
   const { groupName, memberToken } = req.body;
   if (!groupName) return res.status(400).json({ error: "Group name required" });
@@ -250,10 +263,18 @@ app.post("/api/dm/open", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Messages Engine
+// Messages Engine (Text & 1MB Image Attachments)
 app.post("/api/messages/send", authenticate, async (req, res) => {
   const { groupToken, content } = req.body;
   const timestamp = Date.now();
+
+  // Validate image size if sending image attachment
+  if (content.startsWith("data:image/")) {
+    const byteSize = Buffer.byteLength(content, "utf8");
+    if (byteSize > 1024 * 1024) { // 1MB limit
+      return res.status(413).json({ error: "Image attachment exceeds 1MB limit." });
+    }
+  }
 
   try {
     await queryWorker("INSERT INTO messages (group_token, sender, content, created_at) VALUES (?, ?, ?, ?)", [groupToken, req.user.username, content, timestamp]);
@@ -269,15 +290,15 @@ app.get("/api/messages/:groupToken", authenticate, async (req, res) => {
       "SELECT m.*, u.pfp FROM messages m LEFT JOIN users u ON m.sender = u.username WHERE m.group_token = ? ORDER BY m.created_at ASC",
       [req.params.groupToken]
     );
-    res.json(msgs.results);
+    res.json(msgs.results || []);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Admin Routes
+// Admin Control Routes
 app.get("/api/admin/pending", authenticate, async (req, res) => {
   if (req.user.role !== "admin") return res.status(403).json({ error: "Forbidden" });
   const data = await queryWorker("SELECT * FROM pending_accounts");
-  res.json(data.results);
+  res.json(data.results || []);
 });
 
 app.post("/api/admin/action", authenticate, async (req, res) => {
@@ -306,4 +327,4 @@ app.post("/api/admin/delete-user", authenticate, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server online on port ${PORT}`));
