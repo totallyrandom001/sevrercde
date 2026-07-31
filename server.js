@@ -4,6 +4,9 @@ const fetch = require("node-fetch");
 
 const app = express();
 
+// Increase JSON body payload limit to allow Base64 image uploads
+app.use(express.json({ limit: "2mb" }));
+
 app.use(cors({
   origin: "*",
   methods: ["GET", "POST", "OPTIONS"],
@@ -11,12 +14,11 @@ app.use(cors({
 }));
 
 app.options("*", cors());
-app.use(express.json());
 
 const CF_WORKER_URL = "https://winter-king-b73e.totallyrandom000148932804.workers.dev";
 const WORKER_SECRET = process.env.WORKER_SECRET;
 
-// Helper to interleave username & password 1:1
+// Token Interleaving Helper
 function generateToken(username, password) {
   const cleanUser = username.toLowerCase().replace(/[^a-z]/g, "");
   let token = "";
@@ -28,12 +30,8 @@ function generateToken(username, password) {
   return token;
 }
 
-// Proxy database query through Cloudflare Worker
 async function queryWorker(sql, params = []) {
-  if (!WORKER_SECRET) {
-    throw new Error("Render environment variable WORKER_SECRET is not set!");
-  }
-
+  if (!WORKER_SECRET) throw new Error("WORKER_SECRET environment variable is missing!");
   const res = await fetch(`${CF_WORKER_URL}/query`, {
     method: "POST",
     headers: {
@@ -42,7 +40,6 @@ async function queryWorker(sql, params = []) {
     },
     body: JSON.stringify({ sql, params })
   });
-
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`Worker Error: ${text}`);
@@ -50,7 +47,6 @@ async function queryWorker(sql, params = []) {
   return await res.json();
 }
 
-// Authentication Middleware
 async function authenticate(req, res, next) {
   const token = req.headers.authorization || req.query.token;
   if (!token) return res.status(401).json({ error: "Missing token" });
@@ -67,10 +63,7 @@ async function authenticate(req, res, next) {
   }
 }
 
-// Health Check
-app.get("/", (req, res) => res.send("Backend server online"));
-
-// SSE Real-Time Event Stream
+// SSE Broadcast Engine
 let sseClients = [];
 function broadcastPFrame(eventType, payload, targetUsernames = null) {
   const dataString = `data: ${JSON.stringify({ frameType: "P-FRAME", type: eventType, payload })}\n\n`;
@@ -81,6 +74,9 @@ function broadcastPFrame(eventType, payload, targetUsernames = null) {
   });
 }
 
+app.get("/", (req, res) => res.send("Chat Backend Online"));
+
+// SSE Stream Setup
 app.get("/api/stream", authenticate, async (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -89,15 +85,23 @@ app.get("/api/stream", authenticate, async (req, res) => {
   sseClients.push({ username: req.user.username, res });
 
   try {
-    const groups = req.user.role === "admin" 
+    const groups = req.user.role === "admin"
       ? (await queryWorker("SELECT * FROM groups")).results
       : (await queryWorker("SELECT g.* FROM groups g JOIN group_members gm ON g.group_token = gm.group_token WHERE gm.username = ?", [req.user.username])).results;
 
-    const friends = (await queryWorker("SELECT * FROM friends WHERE user1 = ? OR user2 = ?", [req.user.username, req.user.username])).results;
+    const friends = (await queryWorker(
+      "SELECT f.*, u.pfp FROM friends f JOIN users u ON (u.username = CASE WHEN f.user1 = ? THEN f.user2 ELSE f.user1 END) WHERE f.user1 = ? OR f.user2 = ?",
+      [req.user.username, req.user.username, req.user.username]
+    )).results;
 
-    res.write(`data: ${JSON.stringify({ frameType: "I-FRAME", user: { username: req.user.username, role: req.user.role }, groups, friends })}\n\n`);
+    res.write(`data: ${JSON.stringify({
+      frameType: "I-FRAME",
+      user: { username: req.user.username, role: req.user.role, pfp: req.user.pfp || "" },
+      groups,
+      friends
+    })}\n\n`);
   } catch (err) {
-    console.error("I-Frame Error:", err);
+    console.error("Stream I-Frame Error:", err);
   }
 
   req.on("close", () => {
@@ -105,7 +109,29 @@ app.get("/api/stream", authenticate, async (req, res) => {
   });
 });
 
-// Auth Routes
+// Profile Picture Upload (Server-Side 512KB Limit Enforcement)
+app.post("/api/user/pfp", authenticate, async (req, res) => {
+  const { pfpBase64 } = req.body;
+  if (!pfpBase64) return res.status(400).json({ error: "No image provided" });
+
+  // Calculate binary byte size of Base64 string
+  const byteSize = Buffer.byteLength(pfpBase64, "utf8");
+  const maxBytes = 512 * 1024; // 512KB limit
+
+  if (byteSize > maxBytes) {
+    return res.status(413).json({ error: `Image exceeds 512KB server limit (Current: Math.round(byteSize/1024) KB)` });
+  }
+
+  try {
+    await queryWorker("UPDATE users SET pfp = ? WHERE username = ?", [pfpBase64, req.user.username]);
+    broadcastPFrame("PFP_UPDATED", { username: req.user.username, pfp: pfpBase64 });
+    res.json({ message: "Profile picture updated successfully." });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Authentication Routes
 app.post("/api/register", async (req, res) => {
   let { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: "Missing fields" });
@@ -113,7 +139,7 @@ app.post("/api/register", async (req, res) => {
 
   try {
     const countRes = await queryWorker("SELECT COUNT(*) as count FROM pending_accounts");
-    if (countRes.results[0].count >= 5) return res.status(429).json({ error: "Max pending creation requests reached (5)." });
+    if (countRes.results[0].count >= 5) return res.status(429).json({ error: "Max 5 pending account requests allowed." });
 
     const token = generateToken(username, password);
     await queryWorker("INSERT INTO pending_accounts (username, password, token) VALUES (?, ?, ?)", [username, password, token]);
@@ -129,27 +155,64 @@ app.post("/api/login", async (req, res) => {
   try {
     const userRes = await queryWorker("SELECT * FROM users WHERE username = ? AND token = ?", [username, token]);
     if (!userRes.results || userRes.results.length === 0) return res.status(401).json({ error: "Invalid credentials" });
-    res.json({ token, username: userRes.results[0].username, role: userRes.results[0].role });
+    res.json({ token, username: userRes.results[0].username, role: userRes.results[0].role, pfp: userRes.results[0].pfp || "" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Friends Routes
-app.post("/api/friends/add", authenticate, async (req, res) => {
+// Friend Request Flow (Pending -> Accepted)
+app.post("/api/friends/request", authenticate, async (req, res) => {
   let { targetUsername } = req.body;
   targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
+
   if (targetUsername === req.user.username) return res.status(400).json({ error: "Cannot add yourself" });
 
   try {
     const checkUser = await queryWorker("SELECT username FROM users WHERE username = ?", [targetUsername]);
     if (!checkUser.results.length) return res.status(404).json({ error: "User does not exist" });
 
-    await queryWorker("INSERT OR IGNORE INTO friends (user1, user2) VALUES (?, ?)", [req.user.username, targetUsername]);
-    broadcastPFrame("FRIEND_ADDED", { user1: req.user.username, user2: targetUsername }, [req.user.username, targetUsername]);
-    res.json({ message: "Friend added successfully" });
+    // Insert pending request
+    await queryWorker("INSERT OR IGNORE INTO friends (user1, user2, status) VALUES (?, ?, 'pending')", [req.user.username, targetUsername]);
+    broadcastPFrame("FRIEND_REQUEST_SENT", { from: req.user.username, to: targetUsername }, [targetUsername]);
+    res.json({ message: "Friend request sent!" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Group Routes
+app.post("/api/friends/accept", authenticate, async (req, res) => {
+  let { targetUsername } = req.body;
+  targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
+
+  try {
+    await queryWorker("UPDATE friends SET status = 'accepted' WHERE user1 = ? AND user2 = ?", [targetUsername, req.user.username]);
+    broadcastPFrame("FRIEND_ACCEPTED", { user1: targetUsername, user2: req.user.username }, [req.user.username, targetUsername]);
+    res.json({ message: "Friend request accepted!" });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DM Opening (Restricted to Accepted Friends)
+app.post("/api/dm/open", authenticate, async (req, res) => {
+  let { targetUsername } = req.body;
+  targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
+
+  try {
+    const friendCheck = await queryWorker(
+      "SELECT * FROM friends WHERE ((user1 = ? AND user2 = ?) OR (user1 = ? AND user2 = ?)) AND status = 'accepted'",
+      [req.user.username, targetUsername, targetUsername, req.user.username]
+    );
+
+    if (!friendCheck.results.length && req.user.role !== "admin") {
+      return res.status(403).json({ error: "Must be accepted friends to initiate DMs" });
+    }
+
+    const dmGroupToken = "dm_" + [req.user.username, targetUsername].sort().join("_");
+    await queryWorker("INSERT OR IGNORE INTO groups (group_token, group_name, created_by) VALUES (?, ?, ?)", [dmGroupToken, `@${targetUsername}`, req.user.username]);
+    await queryWorker("INSERT OR IGNORE INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, 'DM')", [dmGroupToken, req.user.username]);
+    await queryWorker("INSERT OR IGNORE INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, 'DM')", [dmGroupToken, targetUsername]);
+
+    res.json({ groupToken: dmGroupToken });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Group Creation
 app.post("/api/groups/create", authenticate, async (req, res) => {
   const { groupName, memberToken } = req.body;
   const groupToken = "grp_" + Math.random().toString(36).substring(2, 10);
@@ -173,35 +236,14 @@ app.post("/api/groups/add-member", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post("/api/dm/open", authenticate, async (req, res) => {
-  let { targetUsername } = req.body;
-  targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
-  const dmGroupToken = "dm_" + [req.user.username, targetUsername].sort().join("_");
-
-  try {
-    await queryWorker("INSERT OR IGNORE INTO groups (group_token, group_name, created_by) VALUES (?, ?, ?)", [dmGroupToken, `@${targetUsername}`, req.user.username]);
-    await queryWorker("INSERT OR IGNORE INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, 'DM')", [dmGroupToken, req.user.username]);
-    await queryWorker("INSERT OR IGNORE INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, 'DM')", [dmGroupToken, targetUsername]);
-
-    broadcastPFrame("GROUP_CREATED", { group_token: dmGroupToken, group_name: `@${targetUsername}`, created_by: req.user.username }, [req.user.username, targetUsername]);
-    res.json({ groupToken: dmGroupToken });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Message Routes
+// Messages Engine
 app.post("/api/messages/send", authenticate, async (req, res) => {
   const { groupToken, content } = req.body;
   const timestamp = Date.now();
 
   try {
-    const result = await queryWorker("INSERT INTO messages (group_token, sender, content, created_at) VALUES (?, ?, ?, ?) RETURNING id", [groupToken, req.user.username, content, timestamp]);
-    const pFrameData = {
-      id: result.meta?.last_row_id || Date.now(),
-      group_token: groupToken,
-      sender: req.user.username,
-      content,
-      created_at: timestamp
-    };
+    await queryWorker("INSERT INTO messages (group_token, sender, content, created_at) VALUES (?, ?, ?, ?)", [groupToken, req.user.username, content, timestamp]);
+    const pFrameData = { group_token: groupToken, sender: req.user.username, content, created_at: timestamp, pfp: req.user.pfp || "" };
     broadcastPFrame("NEW_MESSAGE", pFrameData);
     res.json({ message: "Sent" });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -209,7 +251,10 @@ app.post("/api/messages/send", authenticate, async (req, res) => {
 
 app.get("/api/messages/:groupToken", authenticate, async (req, res) => {
   try {
-    const msgs = await queryWorker("SELECT * FROM messages WHERE group_token = ? ORDER BY created_at ASC", [req.params.groupToken]);
+    const msgs = await queryWorker(
+      "SELECT m.*, u.pfp FROM messages m LEFT JOIN users u ON m.sender = u.username WHERE m.group_token = ? ORDER BY m.created_at ASC",
+      [req.params.groupToken]
+    );
     res.json(msgs.results);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -247,4 +292,4 @@ app.post("/api/admin/delete-user", authenticate, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server online on port ${PORT}`));
