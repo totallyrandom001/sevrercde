@@ -89,7 +89,6 @@ app.get('/api/stream', (req, res) => {
   });
 });
 
-// GET or POST /api/delete?password=x&chk=true|false
 app.all('/api/delete', async (req, res, next) => {
   try {
     const password = req.query.password || (req.body && req.body.password);
@@ -100,23 +99,12 @@ app.all('/api/delete', async (req, res, next) => {
     }
 
     if (chk === "true") {
-      // Purge ALL messages
       await queryD1("DELETE FROM messages");
-      return res.json({ 
-        ok: true, 
-        message: "Tüm mesajlar silindi." 
-      });
+      return res.json({ ok: true, message: "Tüm mesajlar silindi." });
     } else {
-      // Delete messages older than 30 minutes
       const thirtyMinsAgo = Date.now() - (30 * 60 * 1000);
-      await queryD1(
-        "DELETE FROM messages WHERE created_at < ?",
-        [thirtyMinsAgo]
-      );
-      return res.json({ 
-        ok: true, 
-        message: "30 dakikadan eski tüm mesajlar silindi." 
-      });
+      await queryD1("DELETE FROM messages WHERE created_at < ?", [thirtyMinsAgo]);
+      return res.json({ ok: true, message: "30 dakikadan eski tüm mesajlar silindi." });
     }
   } catch (err) {
     next(err);
@@ -127,7 +115,8 @@ app.post('/api/send', async (req, res, next) => {
   try {
     const { name: rawName, message: rawMsg, image: rawImg } = req.body || {};
     
-    const name = (rawName || '').toString().trim().slice(0, 50);
+    // Convert username to lowercase
+    const name = (rawName || '').toString().trim().toLowerCase().slice(0, 50);
     const message = (rawMsg || '').toString();
     const image = rawImg ? rawImg.toString() : null;
 
