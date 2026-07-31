@@ -16,23 +16,15 @@ app.options("*", cors());
 const CF_WORKER_URL = "https://winter-king-b73e.totallyrandom000148932804.workers.dev";
 const WORKER_SECRET = process.env.WORKER_SECRET;
 
-// --- In-Memory Rate Limiting Engine ---
+// In-Memory Rate Limiter
 const rateLimitMap = new Map();
 
-/**
- * Checks and updates rate limits for a given identifier key.
- * @param {string} key - Unique key per user or IP action
- * @param {number} windowMs - Time window in milliseconds
- * @param {number} maxHits - Maximum allowed requests within the window
- * @returns {{ limited: boolean, retryAfterSec?: number }}
- */
 function checkRateLimit(key, windowMs, maxHits) {
   const now = Date.now();
   if (!rateLimitMap.has(key)) {
     rateLimitMap.set(key, []);
   }
 
-  // Filter out timestamps outside the active window
   const timestamps = rateLimitMap.get(key).filter(ts => now - ts < windowMs);
 
   if (timestamps.length >= maxHits) {
@@ -46,7 +38,6 @@ function checkRateLimit(key, windowMs, maxHits) {
   return { limited: false };
 }
 
-// Memory Cleanup: Sweep expired entries every 10 minutes to prevent memory leaks
 setInterval(() => {
   const now = Date.now();
   for (const [key, timestamps] of rateLimitMap.entries()) {
@@ -173,101 +164,120 @@ app.get("/api/stream", authenticate, async (req, res) => {
   });
 });
 
-// Registration (Rate Limit: 3 attempts per 15 minutes per IP)
+// PUBLIC: View Pending & Accepted Account Requests (STRICT SECURITY: ONLY USERNAMES RETURNED)
+app.get("/api/public/account-requests", async (req, res) => {
+  const ip = req.headers["x-forwarded-for"] || req.ip || "unknown";
+  const limit = checkRateLimit(`pub_req_${ip}`, 60 * 1000, 15);
+  if (limit.limited) {
+    return res.status(429).json({ error: `Çok fazla istek. Lütfen ${limit.retryAfterSec}s bekleyin.` });
+  }
+
+  try {
+    const pendingRes = await queryWorker("SELECT username FROM pending_accounts");
+    const acceptedRes = await queryWorker("SELECT username FROM users");
+
+    res.json({
+      pending: (pendingRes.results || []).map(r => r.username),
+      accepted: (acceptedRes.results || []).map(r => r.username)
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Registration
 app.post("/api/register", async (req, res) => {
   const ip = req.headers["x-forwarded-for"] || req.ip || "unknown";
   const limit = checkRateLimit(`reg_${ip}`, 15 * 60 * 1000, 3);
   if (limit.limited) {
-    return res.status(429).json({ error: `Too many registration requests. Please wait ${limit.retryAfterSec}s.` });
+    return res.status(429).json({ error: `Çok fazla kayıt isteği. Lütfen ${limit.retryAfterSec}s bekleyin.` });
   }
 
   let { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error: "Missing required fields" });
+  if (!username || !password) return res.status(400).json({ error: "Gerekli alanlar eksik" });
   username = username.toLowerCase().replace(/[^a-z]/g, "");
 
-  if (!username) return res.status(400).json({ error: "Username must contain valid letters" });
+  if (!username) return res.status(400).json({ error: "Kullanıcı adı geçerli harfler içermelidir" });
 
   try {
     const existingUser = await queryWorker("SELECT username FROM users WHERE username = ?", [username]);
     if (existingUser.results && existingUser.results.length > 0) {
-      return res.status(409).json({ error: "An account with this username already exists" });
+      return res.status(409).json({ error: "Bu kullanıcı adına sahip bir hesap zaten var" });
     }
 
     const existingPending = await queryWorker("SELECT username FROM pending_accounts WHERE username = ?", [username]);
     if (existingPending.results && existingPending.results.length > 0) {
-      return res.status(409).json({ error: "Creation request for this username is pending" });
+      return res.status(409).json({ error: "Bu kullanıcı adı için hesap oluşturma talebi zaten bekliyor" });
     }
 
     const countRes = await queryWorker("SELECT COUNT(*) as count FROM pending_accounts");
     if (countRes.results[0].count >= 5) {
-      return res.status(429).json({ error: "Max 5 pending requests allowed" });
+      return res.status(429).json({ error: "Maksimum 5 bekleyen isteğe izin verilir" });
     }
 
     const token = generateToken(username, password);
     await queryWorker("INSERT INTO pending_accounts (username, password, token) VALUES (?, ?, ?)", [username, password, token]);
-    res.json({ message: "Account creation request submitted successfully" });
+    res.json({ message: "Hesap oluşturma talebi onay için yöneticiye gönderildi" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Login (Rate Limit: 5 attempts per 1 minute per IP)
+// Login
 app.post("/api/login", async (req, res) => {
   const ip = req.headers["x-forwarded-for"] || req.ip || "unknown";
   const limit = checkRateLimit(`login_${ip}`, 60 * 1000, 5);
   if (limit.limited) {
-    return res.status(429).json({ error: `Too many login attempts. Please wait ${limit.retryAfterSec}s.` });
+    return res.status(429).json({ error: `Çok fazla giriş denemesi. Lütfen ${limit.retryAfterSec}s bekleyin.` });
   }
 
   let { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error: "Enter username and password" });
+  if (!username || !password) return res.status(400).json({ error: "Kullanıcı adı ve şifre girin" });
   username = username.toLowerCase().replace(/[^a-z]/g, "");
   const token = generateToken(username, password);
 
   try {
     const userRes = await queryWorker("SELECT * FROM users WHERE username = ? AND token = ?", [username, token]);
-    if (!userRes.results || userRes.results.length === 0) return res.status(401).json({ error: "Invalid credentials or pending approval" });
+    if (!userRes.results || userRes.results.length === 0) return res.status(401).json({ error: "Geçersiz kimlik bilgileri veya bekleyen onay" });
     res.json({ token, username: userRes.results[0].username, role: userRes.results[0].role, pfp: userRes.results[0].pfp || "" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// PFP Upload (Rate Limit: 1 update every 10 minutes per user)
+// PFP Upload
 app.post("/api/user/pfp", authenticate, async (req, res) => {
   const limit = checkRateLimit(`pfp_${req.user.username}`, 10 * 60 * 1000, 1);
   if (limit.limited) {
     const mins = Math.ceil(limit.retryAfterSec / 60);
-    return res.status(429).json({ error: `PFP can only be updated once every 10 minutes. Try again in ${mins} minute(s).` });
+    return res.status(429).json({ error: `Profil resmi 10 dakikada bir güncellenebilir. ${mins} dakika sonra tekrar deneyin.` });
   }
 
   const { pfpBase64 } = req.body;
-  if (!pfpBase64) return res.status(400).json({ error: "No image provided" });
+  if (!pfpBase64) return res.status(400).json({ error: "Görsel sağlanmadı" });
 
   const byteSize = Buffer.byteLength(pfpBase64, "utf8");
   if (byteSize > 512 * 1024) {
-    return res.status(413).json({ error: "Image exceeds 512KB server limit" });
+    return res.status(413).json({ error: "Görsel 512KB sunucu sınırını aşıyor" });
   }
 
   try {
     await queryWorker("UPDATE users SET pfp = ? WHERE username = ?", [pfpBase64, req.user.username]);
     broadcastPFrame("PFP_UPDATED", { username: req.user.username, pfp: pfpBase64 });
-    res.json({ message: "Profile picture updated successfully" });
+    res.json({ message: "Profil resmi başarıyla güncellendi" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Friends Management (Rate Limit: 5 requests per 1 minute per user)
+// Friends Management
 app.post("/api/friends/request", authenticate, async (req, res) => {
   const limit = checkRateLimit(`freq_${req.user.username}`, 60 * 1000, 5);
   if (limit.limited) {
-    return res.status(429).json({ error: `Sending requests too quickly. Please wait ${limit.retryAfterSec}s.` });
+    return res.status(429).json({ error: `Çok hızlı istek gönderiyorsunuz. Lütfen ${limit.retryAfterSec}s bekleyin.` });
   }
 
   let { targetUsername } = req.body;
-  if (!targetUsername) return res.status(400).json({ error: "Target username required" });
+  if (!targetUsername) return res.status(400).json({ error: "Hedef kullanıcı adı gerekli" });
   targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
 
-  if (targetUsername === req.user.username) return res.status(400).json({ error: "Cannot add yourself" });
+  if (targetUsername === req.user.username) return res.status(400).json({ error: "Kendinizi ekleyemezsiniz" });
 
   try {
     const checkUser = await queryWorker("SELECT username FROM users WHERE username = ?", [targetUsername]);
-    if (!checkUser.results || !checkUser.results.length) return res.status(404).json({ error: "user could not be found" });
+    if (!checkUser.results || !checkUser.results.length) return res.status(404).json({ error: "Kullanıcı bulunamadı" });
 
     const checkExisting = await queryWorker(
       "SELECT * FROM friends WHERE (user1 = ? AND user2 = ?) OR (user1 = ? AND user2 = ?)",
@@ -276,28 +286,34 @@ app.post("/api/friends/request", authenticate, async (req, res) => {
 
     if (checkExisting.results && checkExisting.results.length > 0) {
       const rel = checkExisting.results[0];
-      if (rel.status === "accepted") return res.status(409).json({ error: "You are already friends with this user" });
-      return res.status(409).json({ error: "Friend request already pending" });
+      if (rel.status === "accepted") return res.status(409).json({ error: "Bu kullanıcı ile zaten arkadaşsınız" });
+      return res.status(409).json({ error: "Arkadaşlık isteği zaten beklemede" });
     }
 
     await queryWorker("INSERT INTO friends (user1, user2, status) VALUES (?, ?, 'pending')", [req.user.username, targetUsername]);
     broadcastPFrame("FRIEND_REQUEST_SENT", { from: req.user.username, to: targetUsername }, [targetUsername]);
-    res.json({ message: "sent request successfully" });
+    res.json({ message: "İstek başarıyla gönderildi" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post("/api/friends/accept", authenticate, async (req, res) => {
+  const limit = checkRateLimit(`faccept_${req.user.username}`, 60 * 1000, 10);
+  if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
+
   let { targetUsername } = req.body;
   targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
 
   try {
     await queryWorker("UPDATE friends SET status = 'accepted' WHERE user1 = ? AND user2 = ?", [targetUsername, req.user.username]);
     broadcastPFrame("FRIEND_ACCEPTED", { user1: targetUsername, user2: req.user.username }, [req.user.username, targetUsername]);
-    res.json({ message: "Accepted friend request" });
+    res.json({ message: "Arkadaşlık isteği kabul edildi" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post("/api/friends/unfriend", authenticate, async (req, res) => {
+  const limit = checkRateLimit(`funfriend_${req.user.username}`, 60 * 1000, 10);
+  if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
+
   let { targetUsername } = req.body;
   targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
 
@@ -307,13 +323,23 @@ app.post("/api/friends/unfriend", authenticate, async (req, res) => {
       [req.user.username, targetUsername, targetUsername, req.user.username]
     );
     broadcastPFrame("FRIEND_REMOVED", { user1: req.user.username, user2: targetUsername }, [req.user.username, targetUsername]);
-    res.json({ message: `Unfriended @${targetUsername}` });
+    res.json({ message: `@${targetUsername} arkadaşlıktan çıkarıldı` });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Group & DM Routes (Group Creation Rate Limit: 2 groups per 5 minutes per user)
+// Group & DM Routes
 app.get("/api/groups/:groupToken/members", authenticate, async (req, res) => {
+  const limit = checkRateLimit(`gmembers_${req.user.username}`, 60 * 1000, 30);
+  if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
+
   try {
+    if (req.user.role !== "admin") {
+      const isMember = await queryWorker("SELECT * FROM group_members WHERE group_token = ? AND username = ?", [req.params.groupToken, req.user.username]);
+      if (!isMember.results || isMember.results.length === 0) {
+        return res.status(403).json({ error: "Erişim reddedildi" });
+      }
+    }
+
     const members = await queryWorker(
       "SELECT gm.username, u.pfp FROM group_members gm LEFT JOIN users u ON gm.username = u.username WHERE gm.group_token = ?",
       [req.params.groupToken]
@@ -325,31 +351,34 @@ app.get("/api/groups/:groupToken/members", authenticate, async (req, res) => {
 app.post("/api/groups/create", authenticate, async (req, res) => {
   const limit = checkRateLimit(`grp_${req.user.username}`, 5 * 60 * 1000, 2);
   if (limit.limited) {
-    return res.status(429).json({ error: `You can only create 2 groups every 5 minutes. Try again in ${limit.retryAfterSec}s.` });
+    return res.status(429).json({ error: `5 dakikada yalnızca 2 grup oluşturabilirsiniz. Lütfen ${limit.retryAfterSec}s bekleyin.` });
   }
 
   const { groupName } = req.body;
-  if (!groupName || !groupName.trim()) return res.status(400).json({ error: "Group name is required" });
+  if (!groupName || !groupName.trim()) return res.status(400).json({ error: "Grup adı gereklidir" });
   const groupToken = "grp_" + Math.random().toString(36).substring(2, 10);
 
   try {
     await queryWorker("INSERT INTO groups (group_token, group_name, created_by) VALUES (?, ?, ?)", [groupToken, groupName.trim(), req.user.username]);
     await queryWorker("INSERT INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, ?)", [groupToken, req.user.username, req.user.token]);
     broadcastPFrame("GROUP_CREATED", { group_token: groupToken, group_name: groupName, created_by: req.user.username });
-    res.json({ message: "Group created successfully", groupToken });
+    res.json({ message: "Grup başarıyla oluşturuldu", groupToken });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post("/api/groups/add-member", authenticate, async (req, res) => {
+  const limit = checkRateLimit(`gadd_${req.user.username}`, 60 * 1000, 10);
+  if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
+
   let { groupToken, targetUsername } = req.body;
-  if (!groupToken || !targetUsername) return res.status(400).json({ error: "Group token and target user required" });
+  if (!groupToken || !targetUsername) return res.status(400).json({ error: "Grup jetonu ve hedef kullanıcı gerekli" });
   targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
 
   try {
     if (req.user.role !== "admin") {
       const isMember = await queryWorker("SELECT * FROM group_members WHERE group_token = ? AND username = ?", [groupToken, req.user.username]);
       if (!isMember.results || isMember.results.length === 0) {
-        return res.status(403).json({ error: "You are not a member of this group" });
+        return res.status(403).json({ error: "Bu grubun üyesi değilsiniz" });
       }
 
       const isFriend = await queryWorker(
@@ -358,28 +387,34 @@ app.post("/api/groups/add-member", authenticate, async (req, res) => {
       );
 
       if (!isFriend.results || isFriend.results.length === 0) {
-        return res.status(403).json({ error: `Must be accepted friends with @${targetUsername} to add them to a group` });
+        return res.status(403).json({ error: `@${targetUsername} kişisini gruba eklemek için kabul edilmiş arkadaş olmalısınız` });
       }
     }
 
     await queryWorker("INSERT OR REPLACE INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, 'DEFAULT')", [groupToken, targetUsername]);
     broadcastPFrame("GROUP_MEMBER_ADDED", { groupToken, targetUsername }, [targetUsername]);
-    res.json({ message: `Added @${targetUsername} to group` });
+    res.json({ message: `@${targetUsername} gruba eklendi` });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post("/api/groups/leave", authenticate, async (req, res) => {
+  const limit = checkRateLimit(`gleave_${req.user.username}`, 60 * 1000, 5);
+  if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
+
   const { groupToken } = req.body;
-  if (!groupToken) return res.status(400).json({ error: "Group token required" });
+  if (!groupToken) return res.status(400).json({ error: "Grup jetonu gerekli" });
 
   try {
     await queryWorker("DELETE FROM group_members WHERE group_token = ? AND username = ?", [groupToken, req.user.username]);
     broadcastPFrame("GROUP_MEMBER_LEFT", { groupToken, username: req.user.username });
-    res.json({ message: "Left group successfully" });
+    res.json({ message: "Gruptan başarıyla ayrılındı" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post("/api/dm/open", authenticate, async (req, res) => {
+  const limit = checkRateLimit(`dm_${req.user.username}`, 60 * 1000, 10);
+  if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
+
   let { targetUsername } = req.body;
   targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
 
@@ -390,7 +425,7 @@ app.post("/api/dm/open", authenticate, async (req, res) => {
     );
 
     if (!friendCheck.results.length && req.user.role !== "admin") {
-      return res.status(403).json({ error: "Must be accepted friends to initiate DMs" });
+      return res.status(403).json({ error: "Direkt mesaj başlatmak için kabul edilmiş arkadaş olmalısınız" });
     }
 
     const dmGroupToken = "dm_" + [req.user.username, targetUsername].sort().join("_");
@@ -402,34 +437,51 @@ app.post("/api/dm/open", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Messaging Engine (Rate Limit: Max 5 messages every 3 seconds per user)
+// Messaging Engine
 app.post("/api/messages/send", authenticate, async (req, res) => {
   const limit = checkRateLimit(`msg_${req.user.username}`, 3 * 1000, 5);
   if (limit.limited) {
-    return res.status(429).json({ error: "You are sending messages too quickly. Please slow down." });
+    return res.status(429).json({ error: "Çok hızlı mesaj gönderiyorsunuz. Lütfen yavaşlayın." });
   }
 
   const { groupToken, content } = req.body;
-  if (!groupToken || !content) return res.status(400).json({ error: "Missing message content" });
+  if (!groupToken || !content) return res.status(400).json({ error: "Mesaj içeriği eksik" });
   const timestamp = Date.now();
 
-  if (content.startsWith("data:image/")) {
-    const byteSize = Buffer.byteLength(content, "utf8");
-    if (byteSize > 1024 * 1024) {
-      return res.status(413).json({ error: "Image attachment exceeds 1MB limit" });
-    }
-  }
-
   try {
+    if (req.user.role !== "admin") {
+      const isMember = await queryWorker("SELECT * FROM group_members WHERE group_token = ? AND username = ?", [groupToken, req.user.username]);
+      if (!isMember.results || isMember.results.length === 0) {
+        return res.status(403).json({ error: "Mesaj göndermek için bu grubun üyesi olmalısınız" });
+      }
+    }
+
+    if (content.startsWith("data:image/")) {
+      const byteSize = Buffer.byteLength(content, "utf8");
+      if (byteSize > 1024 * 1024) {
+        return res.status(413).json({ error: "Görsel eki 1MB sınırını aşıyor" });
+      }
+    }
+
     await queryWorker("INSERT INTO messages (group_token, sender, content, created_at) VALUES (?, ?, ?, ?)", [groupToken, req.user.username, content, timestamp]);
     const pFrameData = { group_token: groupToken, sender: req.user.username, content, created_at: timestamp, pfp: req.user.pfp || "" };
     broadcastPFrame("NEW_MESSAGE", pFrameData);
-    res.json({ message: "Message sent" });
+    res.json({ message: "Mesaj gönderildi" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get("/api/messages/:groupToken", authenticate, async (req, res) => {
+  const limit = checkRateLimit(`getmsg_${req.user.username}`, 60 * 1000, 60);
+  if (limit.limited) return res.status(429).json({ error: "Çok fazla istek." });
+
   try {
+    if (req.user.role !== "admin") {
+      const isMember = await queryWorker("SELECT * FROM group_members WHERE group_token = ? AND username = ?", [req.params.groupToken, req.user.username]);
+      if (!isMember.results || isMember.results.length === 0) {
+        return res.status(403).json({ error: "Grup mesajlarına erişim reddedildi" });
+      }
+    }
+
     const msgs = await queryWorker(
       "SELECT m.*, u.pfp FROM messages m LEFT JOIN users u ON m.sender = u.username WHERE m.group_token = ? ORDER BY m.created_at ASC",
       [req.params.groupToken]
@@ -440,16 +492,24 @@ app.get("/api/messages/:groupToken", authenticate, async (req, res) => {
 
 // Admin Control Routes
 app.get("/api/admin/pending", authenticate, async (req, res) => {
-  if (req.user.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Yasaklandı" });
   const data = await queryWorker("SELECT * FROM pending_accounts");
   res.json(data.results || []);
 });
 
+app.get("/api/admin/users", authenticate, async (req, res) => {
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Yasaklandı" });
+  try {
+    const data = await queryWorker("SELECT username, role FROM users");
+    res.json(data.results || []);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post("/api/admin/action", authenticate, async (req, res) => {
-  if (req.user.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Yasaklandı" });
   const { id, action } = req.body;
   const reqRes = await queryWorker("SELECT * FROM pending_accounts WHERE id = ?", [id]);
-  if (!reqRes.results.length) return res.status(404).json({ error: "Not found" });
+  if (!reqRes.results.length) return res.status(404).json({ error: "Bulunamadı" });
 
   const item = reqRes.results[0];
   if (action === "approve") {
@@ -457,18 +517,18 @@ app.post("/api/admin/action", authenticate, async (req, res) => {
   }
   await queryWorker("DELETE FROM pending_accounts WHERE id = ?", [id]);
   broadcastPFrame("ADMIN_ACTION", { id, action });
-  res.json({ message: `Account request ${action}d.` });
+  res.json({ message: `Hesap talebi ${action} edildi.` });
 });
 
 app.post("/api/admin/delete-user", authenticate, async (req, res) => {
-  if (req.user.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Yasaklandı" });
   const { username } = req.body;
   await queryWorker("DELETE FROM users WHERE username = ?", [username]);
   await queryWorker("DELETE FROM group_members WHERE username = ?", [username]);
   await queryWorker("DELETE FROM friends WHERE user1 = ? OR user2 = ?", [username, username]);
   broadcastPFrame("USER_DELETED", { username });
-  res.json({ message: `User ${username} deleted.` });
+  res.json({ message: `${username} kullanıcısı silindi.` });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server online on port ${PORT}`));
+app.listen(PORT, () => console.log(`Sunucu ${PORT} portunda çevrimiçi`));
