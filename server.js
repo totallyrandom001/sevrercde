@@ -8,7 +8,6 @@ const MAX_MESSAGE_CHARS = 20000;
 const MAX_IMAGE_BASE64_CHARS = 1500000;
 const DELETE_PASSWORD = "sixseven";
 
-// Enable CORS with 2-hour preflight caching
 const corsOptions = {
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -22,7 +21,6 @@ app.use(express.json({ limit: '5mb' }));
 
 let clients = [];
 
-// Helper function to query Cloudflare D1 via REST API
 async function queryD1(sql, params = []) {
   const accountId = process.env.CF_ACCOUNT_ID;
   const databaseId = process.env.CF_DATABASE_ID;
@@ -56,19 +54,15 @@ async function queryD1(sql, params = []) {
   };
 }
 
-// Broadcast new message to all connected SSE clients
 function broadcast(data) {
   const payload = `data: ${JSON.stringify(data)}\n\n`;
   clients.forEach(client => {
     try {
       client.write(payload);
-    } catch (e) {
-      // Ignore dead connection writes
-    }
+    } catch (e) {}
   });
 }
 
-// Keep-alive ping every 20 seconds
 setInterval(() => {
   clients.forEach(client => {
     try {
@@ -77,12 +71,10 @@ setInterval(() => {
   });
 }, 20000);
 
-// Health check endpoint
 app.get('/', (req, res) => {
   res.json({ status: "ok", message: "Server is running!" });
 });
 
-// SSE Real-Time Stream Endpoint
 app.get('/api/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -97,33 +89,40 @@ app.get('/api/stream', (req, res) => {
   });
 });
 
-// GET or POST /api/delete?password=sixseven
+// GET or POST /api/delete?password=x&chk=true|false
 app.all('/api/delete', async (req, res, next) => {
   try {
     const password = req.query.password || (req.body && req.body.password);
+    const chk = String(req.query.chk || (req.body && req.body.chk) || "false").toLowerCase();
 
     if (password !== DELETE_PASSWORD) {
       return res.status(403).json({ error: "Yanlış şifre." });
     }
 
-    // 15 minutes ago in milliseconds
-    const fifteenMinsAgo = Date.now() - (15 * 60 * 1000);
-
-    await queryD1(
-      "DELETE FROM messages WHERE created_at < ?",
-      [fifteenMinsAgo]
-    );
-
-    return res.json({ 
-      ok: true, 
-      message: "15 dakikadan eski tüm mesajlar silindi." 
-    });
+    if (chk === "true") {
+      // Purge ALL messages
+      await queryD1("DELETE FROM messages");
+      return res.json({ 
+        ok: true, 
+        message: "Tüm mesajlar silindi." 
+      });
+    } else {
+      // Delete messages older than 30 minutes
+      const thirtyMinsAgo = Date.now() - (30 * 60 * 1000);
+      await queryD1(
+        "DELETE FROM messages WHERE created_at < ?",
+        [thirtyMinsAgo]
+      );
+      return res.json({ 
+        ok: true, 
+        message: "30 dakikadan eski tüm mesajlar silindi." 
+      });
+    }
   } catch (err) {
     next(err);
   }
 });
 
-// POST /api/send
 app.post('/api/send', async (req, res, next) => {
   try {
     const { name: rawName, message: rawMsg, image: rawImg } = req.body || {};
@@ -160,7 +159,6 @@ app.post('/api/send', async (req, res, next) => {
   }
 });
 
-// GET /api/messages
 app.get('/api/messages', async (req, res, next) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || '50', 10) || 50, 200);
@@ -174,13 +172,11 @@ app.get('/api/messages', async (req, res, next) => {
   }
 });
 
-// Global Error Handler
 app.use((err, req, res, next) => {
   console.error("Server Error:", err.message);
   res.status(500).json({ error: err.message || "Sunucu hatası" });
 });
 
-// 404 Handler
 app.use((req, res) => {
   res.status(404).json({ error: "Route not found" });
 });
