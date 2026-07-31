@@ -47,16 +47,57 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000);
 
-// Otomatik Mesaj Temizliği: 30 günden eski mesajları temizler
-async function cleanupOldMessages() {
+// Veritabanı Toplam Boyutunu Bayt Cinsinden Hesaplar
+async function getDbSizeBytes() {
   try {
-    const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
-    await queryWorker("DELETE FROM messages WHERE created_at < ?", [thirtyDaysAgo]);
+    const countRes = await queryWorker("PRAGMA page_count;");
+    const sizeRes = await queryWorker("PRAGMA page_size;");
+    const pageCount = countRes.results?.[0]?.page_count || 0;
+    const pageSize = sizeRes.results?.[0]?.page_size || 4096;
+    return pageCount * pageSize;
   } catch (err) {
-    console.error("Eski mesaj temizleme hatası:", err.message);
+    console.error("DB Boyutu sorgulama hatası:", err.message);
+    return 0;
   }
 }
 
+// 250MB Kayan Pencere (Rolling Window) Kademeli Temizlik Algoritması
+async function cleanupOldMessages() {
+  try {
+    const MAX_ALLOWED_BYTES = 250 * 1024 * 1024; // 250 MB
+    let currentDbSize = await getDbSizeBytes();
+
+    // Eğer boyut 250MB sınırının altındaysa işlem yapma
+    if (currentDbSize <= MAX_ALLOWED_BYTES) return;
+
+    const now = Date.now();
+    const steps = [
+      // 1. Adım: 24 saatten eski fotoğraflar
+      `DELETE FROM messages WHERE content LIKE 'data:image/%' AND created_at < ${now - (24 * 60 * 60 * 1000)}`,
+      // 2. Adım: 24 saatten eski mesajlar
+      `DELETE FROM messages WHERE created_at < ${now - (24 * 60 * 60 * 1000)}`,
+      // 3. Adım: 12 saatten eski fotoğraflar
+      `DELETE FROM messages WHERE content LIKE 'data:image/%' AND created_at < ${now - (12 * 60 * 60 * 1000)}`,
+      // 4. Adım: 12 saatten eski mesajlar
+      `DELETE FROM messages WHERE created_at < ${now - (12 * 60 * 60 * 1000)}`,
+      // 5. Adım: 5 saatten eski fotoğraflar ve mesajlar
+      `DELETE FROM messages WHERE created_at < ${now - (5 * 60 * 60 * 1000)}`
+    ];
+
+    for (const sql of steps) {
+      await queryWorker(sql);
+      currentDbSize = await getDbSizeBytes();
+      if (currentDbSize <= MAX_ALLOWED_BYTES) {
+        console.log(`DB Boyutu ${Math.round(currentDbSize / (1024 * 1024))}MB seviyesine düşürüldü. Temizlik tamamlandı.`);
+        break;
+      }
+    }
+  } catch (err) {
+    console.error("Kademeli veritabanı temizleme hatası:", err.message);
+  }
+}
+
+// Her 1 saatte bir veritabanı boyut kontrolünü ve temizliğini çalıştırır
 setInterval(cleanupOldMessages, 60 * 60 * 1000);
 cleanupOldMessages();
 
@@ -117,8 +158,8 @@ function broadcastPFrame(eventType, payload, targetUsernames = null) {
 
 async function fetchUserSnapshot(user) {
   const groupsRes = user.role === "admin"
-    ? await queryWorker("SELECT * FROM groups")
-    : await queryWorker("SELECT g.* FROM groups g JOIN group_members gm ON g.group_token = gm.group_token WHERE gm.username = ?", [user.username]);
+    ? await queryWorker("SELECT id, group_token, group_name, created_by, allow_sub_invites FROM groups ORDER BY id ASC")
+    : await queryWorker("SELECT g.id, g.group_token, g.group_name, g.created_by, g.allow_sub_invites FROM groups g JOIN group_members gm ON g.group_token = gm.group_token WHERE gm.username = ? ORDER BY g.id ASC", [user.username]);
   const groups = groupsRes.results || [];
 
   const friendsRes = await queryWorker("SELECT * FROM friends WHERE user1 = ? OR user2 = ?", [user.username, user.username]);
@@ -187,7 +228,7 @@ app.get("/api/public/account-requests", async (req, res) => {
 
   try {
     const pendingRes = await queryWorker("SELECT username FROM pending_accounts");
-    const acceptedRes = await queryWorker("SELECT username FROM users");
+    const acceptedRes = await queryWorker("SELECT username FROM users WHERE username NOT IN (SELECT DISTINCT sender FROM messages)");
 
     res.json({
       pending: (pendingRes.results || []).map(r => r.username),
@@ -571,7 +612,7 @@ app.post("/api/dm/open", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Messaging Engine (Gönderme)
+// Messaging Engine (Gönderme - 1MB Sınırı Sunucu Kontrolü)
 app.post("/api/messages/send", authenticate, async (req, res) => {
   const limit = checkRateLimit(`msg_${req.user.username}`, 3 * 1000, 5);
   if (limit.limited) {
@@ -592,8 +633,9 @@ app.post("/api/messages/send", authenticate, async (req, res) => {
 
     if (content.startsWith("data:image/")) {
       const byteSize = Buffer.byteLength(content, "utf8");
-      if (byteSize > 1024 * 1024) {
-        return res.status(413).json({ error: "Görsel eki 1MB sınırını aşıyor" });
+      const MAX_BYTES = 1024 * 1024; // 1 MB
+      if (byteSize > MAX_BYTES) {
+        return res.status(413).json({ error: "Görsel eki 1MB sınırını aşıyor!" });
       }
     }
 
@@ -617,7 +659,7 @@ app.post("/api/messages/send", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Kendi Mesajını Silme Endpoint'i (Sunucu Tarafı Yetki Kontrollü)
+// Kendi Mesajını Silme Endpoint'i
 app.post("/api/messages/delete", authenticate, async (req, res) => {
   const limit = checkRateLimit(`msgdel_${req.user.username}`, 3 * 1000, 10);
   if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
@@ -638,7 +680,6 @@ app.post("/api/messages/delete", authenticate, async (req, res) => {
 
     const msg = msgRes.results[0];
 
-    // Sunucu Tarafı Güvenlik Kontrolü: Mesajı sadece gönderen veya yönetici silebilir
     if (msg.sender !== req.user.username && req.user.role !== "admin") {
       return res.status(403).json({ error: "Bu mesajı silme yetkiniz yok!" });
     }
@@ -715,4 +756,4 @@ app.post("/api/admin/delete-user", authenticate, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`SOPERT Sunucusu ${PORT} portunda çevrimiçi`));
+app.listen(PORT, () => console.log(`SOPERT Sunucusu ${PORT} portunda çevreliçi`));
