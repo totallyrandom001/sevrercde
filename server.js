@@ -164,7 +164,7 @@ app.get("/api/stream", authenticate, async (req, res) => {
   });
 });
 
-// PUBLIC: View Pending & Accepted Account Requests (STRICT SECURITY: ONLY USERNAMES RETURNED)
+// PUBLIC: View Pending & Accepted Account Requests
 app.get("/api/public/account-requests", async (req, res) => {
   const ip = req.headers["x-forwarded-for"] || req.ip || "unknown";
   const limit = checkRateLimit(`pub_req_${ip}`, 60 * 1000, 15);
@@ -333,6 +333,12 @@ app.get("/api/groups/:groupToken/members", authenticate, async (req, res) => {
   if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
 
   try {
+    const groupRes = await queryWorker("SELECT created_by, allow_sub_invites FROM groups WHERE group_token = ?", [req.params.groupToken]);
+    if (!groupRes.results || groupRes.results.length === 0) {
+      return res.status(404).json({ error: "Grup bulunamadı" });
+    }
+    const groupInfo = groupRes.results[0];
+
     if (req.user.role !== "admin") {
       const isMember = await queryWorker("SELECT * FROM group_members WHERE group_token = ? AND username = ?", [req.params.groupToken, req.user.username]);
       if (!isMember.results || isMember.results.length === 0) {
@@ -341,10 +347,14 @@ app.get("/api/groups/:groupToken/members", authenticate, async (req, res) => {
     }
 
     const members = await queryWorker(
-      "SELECT gm.username, u.pfp FROM group_members gm LEFT JOIN users u ON gm.username = u.username WHERE gm.group_token = ?",
+      "SELECT gm.username, gm.can_add_members, gm.invited_by, u.pfp FROM group_members gm LEFT JOIN users u ON gm.username = u.username WHERE gm.group_token = ?",
       [req.params.groupToken]
     );
-    res.json(members.results || []);
+
+    res.json({
+      groupInfo,
+      members: members.results || []
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -359,8 +369,8 @@ app.post("/api/groups/create", authenticate, async (req, res) => {
   const groupToken = "grp_" + Math.random().toString(36).substring(2, 10);
 
   try {
-    await queryWorker("INSERT INTO groups (group_token, group_name, created_by) VALUES (?, ?, ?)", [groupToken, groupName.trim(), req.user.username]);
-    await queryWorker("INSERT INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, ?)", [groupToken, req.user.username, req.user.token]);
+    await queryWorker("INSERT INTO groups (group_token, group_name, created_by, allow_sub_invites) VALUES (?, ?, ?, 1)", [groupToken, groupName.trim(), req.user.username]);
+    await queryWorker("INSERT INTO group_members (group_token, username, custom_member_token, can_add_members, invited_by) VALUES (?, ?, ?, 1, ?)", [groupToken, req.user.username, req.user.token, req.user.username]);
     broadcastPFrame("GROUP_CREATED", { group_token: groupToken, group_name: groupName, created_by: req.user.username });
     res.json({ message: "Grup başarıyla oluşturuldu", groupToken });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -375,10 +385,30 @@ app.post("/api/groups/add-member", authenticate, async (req, res) => {
   targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
 
   try {
+    const groupRes = await queryWorker("SELECT * FROM groups WHERE group_token = ?", [groupToken]);
+    if (!groupRes.results || groupRes.results.length === 0) return res.status(404).json({ error: "Grup bulunamadı" });
+    const group = groupRes.results[0];
+
     if (req.user.role !== "admin") {
-      const isMember = await queryWorker("SELECT * FROM group_members WHERE group_token = ? AND username = ?", [groupToken, req.user.username]);
-      if (!isMember.results || isMember.results.length === 0) {
+      const isMemberRes = await queryWorker("SELECT * FROM group_members WHERE group_token = ? AND username = ?", [groupToken, req.user.username]);
+      if (!isMemberRes.results || isMemberRes.results.length === 0) {
         return res.status(403).json({ error: "Bu grubun üyesi değilsiniz" });
+      }
+      const requesterMember = isMemberRes.results[0];
+
+      const isOwner = group.created_by === req.user.username;
+      if (!isOwner) {
+        if (requesterMember.can_add_members === 0) {
+          return res.status(403).json({ error: "Gruba üye ekleme yetkiniz kapatılmış" });
+        }
+
+        const allowSubInvites = group.allow_sub_invites !== 0;
+        if (!allowSubInvites) {
+          const wasInvitedByOwner = requesterMember.invited_by === group.created_by || requesterMember.username === group.created_by;
+          if (!wasInvitedByOwner) {
+            return res.status(403).json({ error: "Bu grupta yalnızca kurucu tarafından eklenen üyeler başkalarını davet edebilir" });
+          }
+        }
       }
 
       const isFriend = await queryWorker(
@@ -391,12 +421,92 @@ app.post("/api/groups/add-member", authenticate, async (req, res) => {
       }
     }
 
-    await queryWorker("INSERT OR REPLACE INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, 'DEFAULT')", [groupToken, targetUsername]);
+    await queryWorker("INSERT OR REPLACE INTO group_members (group_token, username, custom_member_token, can_add_members, invited_by) VALUES (?, ?, 'DEFAULT', 1, ?)", [groupToken, targetUsername, req.user.username]);
     broadcastPFrame("GROUP_MEMBER_ADDED", { groupToken, targetUsername }, [targetUsername]);
     res.json({ message: `@${targetUsername} gruba eklendi` });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Remove Member (Only Group Owner or Admin)
+app.post("/api/groups/remove-member", authenticate, async (req, res) => {
+  const limit = checkRateLimit(`grem_${req.user.username}`, 60 * 1000, 10);
+  if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
+
+  let { groupToken, targetUsername } = req.body;
+  if (!groupToken || !targetUsername) return res.status(400).json({ error: "Eksik parametreler" });
+  targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
+
+  try {
+    const groupRes = await queryWorker("SELECT * FROM groups WHERE group_token = ?", [groupToken]);
+    if (!groupRes.results || groupRes.results.length === 0) return res.status(404).json({ error: "Grup bulunamadı" });
+    const group = groupRes.results[0];
+
+    const isOwner = group.created_by === req.user.username;
+    if (!isOwner && req.user.role !== "admin") {
+      return res.status(403).json({ error: "Yalnızca grup kurucusu üyeleri gruptan çıkarabilir" });
+    }
+
+    if (targetUsername === group.created_by) {
+      return res.status(400).json({ error: "Grup kurucusu gruptan çıkarılamaz" });
+    }
+
+    await queryWorker("DELETE FROM group_members WHERE group_token = ? AND username = ?", [groupToken, targetUsername]);
+    broadcastPFrame("GROUP_MEMBER_LEFT", { groupToken, username: targetUsername });
+    res.json({ message: `@${targetUsername} gruptan çıkarıldı` });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Toggle individual member's invite permission (Only Owner or Admin)
+app.post("/api/groups/toggle-member-invite-perm", authenticate, async (req, res) => {
+  const limit = checkRateLimit(`gtoggle_${req.user.username}`, 60 * 1000, 20);
+  if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
+
+  let { groupToken, targetUsername, canAddMembers } = req.body;
+  if (!groupToken || !targetUsername) return res.status(400).json({ error: "Eksik parametreler" });
+
+  try {
+    const groupRes = await queryWorker("SELECT * FROM groups WHERE group_token = ?", [groupToken]);
+    if (!groupRes.results || groupRes.results.length === 0) return res.status(404).json({ error: "Grup bulunamadı" });
+    const group = groupRes.results[0];
+
+    if (group.created_by !== req.user.username && req.user.role !== "admin") {
+      return res.status(403).json({ error: "Yalnızca grup kurucusu izinleri değiştirebilir" });
+    }
+
+    const newPerm = canAddMembers ? 1 : 0;
+    await queryWorker("UPDATE group_members SET can_add_members = ? WHERE group_token = ? AND username = ?", [newPerm, groupToken, targetUsername]);
+
+    broadcastPFrame("GROUP_PERM_UPDATED", { groupToken, targetUsername, canAddMembers: newPerm });
+    res.json({ message: "Üye izni güncellendi" });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Toggle group-wide sub-invite policy (Only Owner or Admin)
+app.post("/api/groups/toggle-sub-invites", authenticate, async (req, res) => {
+  const limit = checkRateLimit(`gsub_${req.user.username}`, 60 * 1000, 10);
+  if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
+
+  let { groupToken, allowSubInvites } = req.body;
+  if (!groupToken) return res.status(400).json({ error: "Grup jetonu gerekli" });
+
+  try {
+    const groupRes = await queryWorker("SELECT * FROM groups WHERE group_token = ?", [groupToken]);
+    if (!groupRes.results || groupRes.results.length === 0) return res.status(404).json({ error: "Grup bulunamadı" });
+    const group = groupRes.results[0];
+
+    if (group.created_by !== req.user.username && req.user.role !== "admin") {
+      return res.status(403).json({ error: "Yalnızca grup kurucusu bu ayarı değiştirebilir" });
+    }
+
+    const newVal = allowSubInvites ? 1 : 0;
+    await queryWorker("UPDATE groups SET allow_sub_invites = ? WHERE group_token = ?", [newVal, groupToken]);
+
+    broadcastPFrame("GROUP_SETTING_UPDATED", { groupToken, allowSubInvites: newVal });
+    res.json({ message: "Grup davet ilkesi güncellendi" });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Group Leaving (Fixed Ownership Cleanup & DB Sync)
 app.post("/api/groups/leave", authenticate, async (req, res) => {
   const limit = checkRateLimit(`gleave_${req.user.username}`, 60 * 1000, 5);
   if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
@@ -406,6 +516,21 @@ app.post("/api/groups/leave", authenticate, async (req, res) => {
 
   try {
     await queryWorker("DELETE FROM group_members WHERE group_token = ? AND username = ?", [groupToken, req.user.username]);
+
+    const remainingMembers = await queryWorker("SELECT username FROM group_members WHERE group_token = ?", [groupToken]);
+    const groupRes = await queryWorker("SELECT created_by FROM groups WHERE group_token = ?", [groupToken]);
+
+    if (groupRes.results && groupRes.results.length > 0) {
+      const group = groupRes.results[0];
+      if (!remainingMembers.results || remainingMembers.results.length === 0) {
+        await queryWorker("DELETE FROM groups WHERE group_token = ?", [groupToken]);
+        await queryWorker("DELETE FROM messages WHERE group_token = ?", [groupToken]);
+      } else if (group.created_by === req.user.username) {
+        const nextOwner = remainingMembers.results[0].username;
+        await queryWorker("UPDATE groups SET created_by = ? WHERE group_token = ?", [nextOwner, groupToken]);
+      }
+    }
+
     broadcastPFrame("GROUP_MEMBER_LEFT", { groupToken, username: req.user.username });
     res.json({ message: "Gruptan başarıyla ayrılındı" });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -429,9 +554,9 @@ app.post("/api/dm/open", authenticate, async (req, res) => {
     }
 
     const dmGroupToken = "dm_" + [req.user.username, targetUsername].sort().join("_");
-    await queryWorker("INSERT OR IGNORE INTO groups (group_token, group_name, created_by) VALUES (?, ?, ?)", [dmGroupToken, `@${targetUsername}`, req.user.username]);
-    await queryWorker("INSERT OR IGNORE INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, 'DM')", [dmGroupToken, req.user.username]);
-    await queryWorker("INSERT OR IGNORE INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, 'DM')", [dmGroupToken, targetUsername]);
+    await queryWorker("INSERT OR IGNORE INTO groups (group_token, group_name, created_by, allow_sub_invites) VALUES (?, ?, ?, 1)", [dmGroupToken, `@${targetUsername}`, req.user.username]);
+    await queryWorker("INSERT OR IGNORE INTO group_members (group_token, username, custom_member_token, can_add_members) VALUES (?, ?, 'DM', 1)", [dmGroupToken, req.user.username]);
+    await queryWorker("INSERT OR IGNORE INTO group_members (group_token, username, custom_member_token, can_add_members) VALUES (?, ?, 'DM', 1)", [dmGroupToken, targetUsername]);
 
     res.json({ groupToken: dmGroupToken });
   } catch (err) { res.status(500).json({ error: err.message }); }
