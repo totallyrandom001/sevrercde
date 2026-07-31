@@ -47,6 +47,19 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000);
 
+// Otomatik Mesaj Temizliği: 30 günden eski mesajları temizler
+async function cleanupOldMessages() {
+  try {
+    const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
+    await queryWorker("DELETE FROM messages WHERE created_at < ?", [thirtyDaysAgo]);
+  } catch (err) {
+    console.error("Eski mesaj temizleme hatası:", err.message);
+  }
+}
+
+setInterval(cleanupOldMessages, 60 * 60 * 1000);
+cleanupOldMessages();
+
 function generateToken(username, password) {
   const cleanUser = username.toLowerCase().replace(/[^a-z]/g, "");
   let token = "";
@@ -129,7 +142,7 @@ async function fetchUserSnapshot(user) {
   return { groups, friends };
 }
 
-app.get("/", (req, res) => res.send("Chat Backend Online"));
+app.get("/", (req, res) => res.send("SOPERT Backend Online"));
 
 // Snapshot API
 app.get("/api/snapshot", authenticate, async (req, res) => {
@@ -164,7 +177,7 @@ app.get("/api/stream", authenticate, async (req, res) => {
   });
 });
 
-// PUBLIC: View Pending & Accepted Account Requests
+// PUBLIC: View Account Requests
 app.get("/api/public/account-requests", async (req, res) => {
   const ip = req.headers["x-forwarded-for"] || req.ip || "unknown";
   const limit = checkRateLimit(`pub_req_${ip}`, 60 * 1000, 15);
@@ -291,7 +304,7 @@ app.post("/api/friends/request", authenticate, async (req, res) => {
     }
 
     await queryWorker("INSERT INTO friends (user1, user2, status) VALUES (?, ?, 'pending')", [req.user.username, targetUsername]);
-    broadcastPFrame("FRIEND_REQUEST_SENT", { from: req.user.username, to: targetUsername }, [targetUsername]);
+    broadcastPFrame("FRIEND_REQUEST_SENT", { from: req.user.username, to: targetUsername }, [targetUsername, req.user.username]);
     res.json({ message: "İstek başarıyla gönderildi" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -427,7 +440,6 @@ app.post("/api/groups/add-member", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Remove Member (Only Group Owner or Admin)
 app.post("/api/groups/remove-member", authenticate, async (req, res) => {
   const limit = checkRateLimit(`grem_${req.user.username}`, 60 * 1000, 10);
   if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
@@ -456,7 +468,6 @@ app.post("/api/groups/remove-member", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Toggle individual member's invite permission (Only Owner or Admin)
 app.post("/api/groups/toggle-member-invite-perm", authenticate, async (req, res) => {
   const limit = checkRateLimit(`gtoggle_${req.user.username}`, 60 * 1000, 20);
   if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
@@ -481,7 +492,6 @@ app.post("/api/groups/toggle-member-invite-perm", authenticate, async (req, res)
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Toggle group-wide sub-invite policy (Only Owner or Admin)
 app.post("/api/groups/toggle-sub-invites", authenticate, async (req, res) => {
   const limit = checkRateLimit(`gsub_${req.user.username}`, 60 * 1000, 10);
   if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
@@ -506,7 +516,6 @@ app.post("/api/groups/toggle-sub-invites", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Group Leaving (Fixed Ownership Cleanup & DB Sync)
 app.post("/api/groups/leave", authenticate, async (req, res) => {
   const limit = checkRateLimit(`gleave_${req.user.username}`, 60 * 1000, 5);
   if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
@@ -562,14 +571,14 @@ app.post("/api/dm/open", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Messaging Engine
+// Messaging Engine (Gönderme)
 app.post("/api/messages/send", authenticate, async (req, res) => {
   const limit = checkRateLimit(`msg_${req.user.username}`, 3 * 1000, 5);
   if (limit.limited) {
     return res.status(429).json({ error: "Çok hızlı mesaj gönderiyorsunuz. Lütfen yavaşlayın." });
   }
 
-  const { groupToken, content } = req.body;
+  const { groupToken, content, replyToSender, replyToContent } = req.body;
   if (!groupToken || !content) return res.status(400).json({ error: "Mesaj içeriği eksik" });
   const timestamp = Date.now();
 
@@ -588,10 +597,60 @@ app.post("/api/messages/send", authenticate, async (req, res) => {
       }
     }
 
-    await queryWorker("INSERT INTO messages (group_token, sender, content, created_at) VALUES (?, ?, ?, ?)", [groupToken, req.user.username, content, timestamp]);
-    const pFrameData = { group_token: groupToken, sender: req.user.username, content, created_at: timestamp, pfp: req.user.pfp || "" };
+    await queryWorker(
+      "INSERT INTO messages (group_token, sender, content, created_at, reply_to_sender, reply_to_content) VALUES (?, ?, ?, ?, ?, ?)",
+      [groupToken, req.user.username, content, timestamp, replyToSender || null, replyToContent || null]
+    );
+
+    const pFrameData = {
+      group_token: groupToken,
+      sender: req.user.username,
+      content,
+      created_at: timestamp,
+      reply_to_sender: replyToSender || null,
+      reply_to_content: replyToContent || null,
+      pfp: req.user.pfp || ""
+    };
+
     broadcastPFrame("NEW_MESSAGE", pFrameData);
     res.json({ message: "Mesaj gönderildi" });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Kendi Mesajını Silme Endpoint'i (Sunucu Tarafı Yetki Kontrollü)
+app.post("/api/messages/delete", authenticate, async (req, res) => {
+  const limit = checkRateLimit(`msgdel_${req.user.username}`, 3 * 1000, 10);
+  if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
+
+  const { messageId, groupToken, createdAt } = req.body;
+
+  try {
+    let msgRes;
+    if (messageId) {
+      msgRes = await queryWorker("SELECT * FROM messages WHERE id = ?", [messageId]);
+    } else {
+      msgRes = await queryWorker("SELECT * FROM messages WHERE group_token = ? AND sender = ? AND created_at = ?", [groupToken, req.user.username, createdAt]);
+    }
+
+    if (!msgRes.results || msgRes.results.length === 0) {
+      return res.status(404).json({ error: "Silinecek mesaj bulunamadı" });
+    }
+
+    const msg = msgRes.results[0];
+
+    // Sunucu Tarafı Güvenlik Kontrolü: Mesajı sadece gönderen veya yönetici silebilir
+    if (msg.sender !== req.user.username && req.user.role !== "admin") {
+      return res.status(403).json({ error: "Bu mesajı silme yetkiniz yok!" });
+    }
+
+    if (messageId) {
+      await queryWorker("DELETE FROM messages WHERE id = ?", [messageId]);
+    } else {
+      await queryWorker("DELETE FROM messages WHERE group_token = ? AND sender = ? AND created_at = ?", [groupToken, req.user.username, createdAt]);
+    }
+
+    broadcastPFrame("MESSAGE_DELETED", { groupToken: msg.group_token, messageId: msg.id, createdAt: msg.created_at });
+    res.json({ message: "Mesaj başarıyla silindi" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -656,4 +715,4 @@ app.post("/api/admin/delete-user", authenticate, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Sunucu ${PORT} portunda çevrimiçi`));
+app.listen(PORT, () => console.log(`SOPERT Sunucusu ${PORT} portunda çevrimiçi`));
