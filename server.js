@@ -4,9 +4,7 @@ const fetch = require("node-fetch");
 
 const app = express();
 
-// Increase JSON body payload limit to allow Base64 image uploads
 app.use(express.json({ limit: "2mb" }));
-
 app.use(cors({
   origin: "*",
   methods: ["GET", "POST", "OPTIONS"],
@@ -18,7 +16,6 @@ app.options("*", cors());
 const CF_WORKER_URL = "https://winter-king-b73e.totallyrandom000148932804.workers.dev";
 const WORKER_SECRET = process.env.WORKER_SECRET;
 
-// Token Interleaving Helper
 function generateToken(username, password) {
   const cleanUser = username.toLowerCase().replace(/[^a-z]/g, "");
   let token = "";
@@ -82,7 +79,8 @@ app.get("/api/stream", authenticate, async (req, res) => {
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
 
-  sseClients.push({ username: req.user.username, res });
+  const client = { username: req.user.username, res };
+  sseClients.push(client);
 
   try {
     const groups = req.user.role === "admin"
@@ -109,42 +107,39 @@ app.get("/api/stream", authenticate, async (req, res) => {
   });
 });
 
-// Profile Picture Upload (Server-Side 512KB Limit Enforcement)
-app.post("/api/user/pfp", authenticate, async (req, res) => {
-  const { pfpBase64 } = req.body;
-  if (!pfpBase64) return res.status(400).json({ error: "No image provided" });
-
-  // Calculate binary byte size of Base64 string
-  const byteSize = Buffer.byteLength(pfpBase64, "utf8");
-  const maxBytes = 512 * 1024; // 512KB limit
-
-  if (byteSize > maxBytes) {
-    return res.status(413).json({ error: `Image exceeds 512KB server limit (Current: Math.round(byteSize/1024) KB)` });
-  }
-
-  try {
-    await queryWorker("UPDATE users SET pfp = ? WHERE username = ?", [pfpBase64, req.user.username]);
-    broadcastPFrame("PFP_UPDATED", { username: req.user.username, pfp: pfpBase64 });
-    res.json({ message: "Profile picture updated successfully." });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Authentication Routes
+// Account Registration with Existing Account Prevention Check
 app.post("/api/register", async (req, res) => {
   let { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error: "Missing fields" });
+  if (!username || !password) return res.status(400).json({ error: "Missing required fields" });
   username = username.toLowerCase().replace(/[^a-z]/g, "");
 
+  if (!username) return res.status(400).json({ error: "Username must contain valid letters" });
+
   try {
+    // 1. Check if user already exists in registered accounts
+    const existingUser = await queryWorker("SELECT username FROM users WHERE username = ?", [username]);
+    if (existingUser.results && existingUser.results.length > 0) {
+      return res.status(409).json({ error: "An account with this username already exists." });
+    }
+
+    // 2. Check if user already exists in pending approval requests
+    const existingPending = await queryWorker("SELECT username FROM pending_accounts WHERE username = ?", [username]);
+    if (existingPending.results && existingPending.results.length > 0) {
+      return res.status(409).json({ error: "An account creation request for this username is already pending approval." });
+    }
+
+    // 3. Check max pending account limit (5)
     const countRes = await queryWorker("SELECT COUNT(*) as count FROM pending_accounts");
-    if (countRes.results[0].count >= 5) return res.status(429).json({ error: "Max 5 pending account requests allowed." });
+    if (countRes.results[0].count >= 5) {
+      return res.status(429).json({ error: "Max 5 pending account requests reached. Try again later." });
+    }
 
     const token = generateToken(username, password);
     await queryWorker("INSERT INTO pending_accounts (username, password, token) VALUES (?, ?, ?)", [username, password, token]);
     res.json({ message: "Account creation request submitted for admin approval." });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post("/api/login", async (req, res) => {
@@ -154,12 +149,29 @@ app.post("/api/login", async (req, res) => {
 
   try {
     const userRes = await queryWorker("SELECT * FROM users WHERE username = ? AND token = ?", [username, token]);
-    if (!userRes.results || userRes.results.length === 0) return res.status(401).json({ error: "Invalid credentials" });
+    if (!userRes.results || userRes.results.length === 0) return res.status(401).json({ error: "Invalid credentials or pending approval" });
     res.json({ token, username: userRes.results[0].username, role: userRes.results[0].role, pfp: userRes.results[0].pfp || "" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Friend Request Flow (Pending -> Accepted)
+// Profile Picture Upload
+app.post("/api/user/pfp", authenticate, async (req, res) => {
+  const { pfpBase64 } = req.body;
+  if (!pfpBase64) return res.status(400).json({ error: "No image provided" });
+
+  const byteSize = Buffer.byteLength(pfpBase64, "utf8");
+  if (byteSize > 512 * 1024) {
+    return res.status(413).json({ error: "Image exceeds 512KB limit." });
+  }
+
+  try {
+    await queryWorker("UPDATE users SET pfp = ? WHERE username = ?", [pfpBase64, req.user.username]);
+    broadcastPFrame("PFP_UPDATED", { username: req.user.username, pfp: pfpBase64 });
+    res.json({ message: "Profile picture updated." });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Friends Management
 app.post("/api/friends/request", authenticate, async (req, res) => {
   let { targetUsername } = req.body;
   targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
@@ -170,7 +182,6 @@ app.post("/api/friends/request", authenticate, async (req, res) => {
     const checkUser = await queryWorker("SELECT username FROM users WHERE username = ?", [targetUsername]);
     if (!checkUser.results.length) return res.status(404).json({ error: "User does not exist" });
 
-    // Insert pending request
     await queryWorker("INSERT OR IGNORE INTO friends (user1, user2, status) VALUES (?, ?, 'pending')", [req.user.username, targetUsername]);
     broadcastPFrame("FRIEND_REQUEST_SENT", { from: req.user.username, to: targetUsername }, [targetUsername]);
     res.json({ message: "Friend request sent!" });
@@ -188,7 +199,34 @@ app.post("/api/friends/accept", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// DM Opening (Restricted to Accepted Friends)
+// Group Creation & In-Group Member Management
+app.post("/api/groups/create", authenticate, async (req, res) => {
+  const { groupName, memberToken } = req.body;
+  if (!groupName) return res.status(400).json({ error: "Group name required" });
+  const groupToken = "grp_" + Math.random().toString(36).substring(2, 10);
+
+  try {
+    await queryWorker("INSERT INTO groups (group_token, group_name, created_by) VALUES (?, ?, ?)", [groupToken, groupName, req.user.username]);
+    await queryWorker("INSERT INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, ?)", [groupToken, req.user.username, memberToken || req.user.token]);
+    broadcastPFrame("GROUP_CREATED", { group_token: groupToken, group_name: groupName, created_by: req.user.username });
+    res.json({ message: "Group created", groupToken });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/api/groups/add-member", authenticate, async (req, res) => {
+  let { groupToken, targetUsername } = req.body;
+  targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
+
+  try {
+    const checkUser = await queryWorker("SELECT username FROM users WHERE username = ?", [targetUsername]);
+    if (!checkUser.results.length) return res.status(404).json({ error: "User does not exist" });
+
+    await queryWorker("INSERT OR REPLACE INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, 'DEFAULT')", [groupToken, targetUsername]);
+    broadcastPFrame("GROUP_MEMBER_ADDED", { groupToken, targetUsername }, [targetUsername]);
+    res.json({ message: `${targetUsername} added to group successfully.` });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post("/api/dm/open", authenticate, async (req, res) => {
   let { targetUsername } = req.body;
   targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
@@ -209,30 +247,6 @@ app.post("/api/dm/open", authenticate, async (req, res) => {
     await queryWorker("INSERT OR IGNORE INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, 'DM')", [dmGroupToken, targetUsername]);
 
     res.json({ groupToken: dmGroupToken });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Group Creation
-app.post("/api/groups/create", authenticate, async (req, res) => {
-  const { groupName, memberToken } = req.body;
-  const groupToken = "grp_" + Math.random().toString(36).substring(2, 10);
-
-  try {
-    await queryWorker("INSERT INTO groups (group_token, group_name, created_by) VALUES (?, ?, ?)", [groupToken, groupName, req.user.username]);
-    await queryWorker("INSERT INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, ?)", [groupToken, req.user.username, memberToken || req.user.token]);
-    broadcastPFrame("GROUP_CREATED", { group_token: groupToken, group_name: groupName, created_by: req.user.username });
-    res.json({ message: "Group created", groupToken });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/groups/add-member", authenticate, async (req, res) => {
-  let { groupToken, targetUsername } = req.body;
-  targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
-
-  try {
-    await queryWorker("INSERT OR REPLACE INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, 'DEFAULT')", [groupToken, targetUsername]);
-    broadcastPFrame("GROUP_MEMBER_ADDED", { groupToken, targetUsername }, [targetUsername]);
-    res.json({ message: `${targetUsername} added to group.` });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -292,4 +306,4 @@ app.post("/api/admin/delete-user", authenticate, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server online on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
