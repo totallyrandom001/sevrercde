@@ -1,13 +1,14 @@
 {
-  "name": "chat-backend",
+  "name": "render-chat-backend",
   "version": "1.0.0",
-  "description": "Express Chat Backend communicating with Cloudflare D1",
+  "description": "Render backend proxy to CF Worker D1",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "express": "^4.18.2",
+    "node-fetch": "^2.6.9"
   }
 }
