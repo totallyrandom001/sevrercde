@@ -4,9 +4,7 @@ const fetch = require("node-fetch");
 
 const app = express();
 
-// Increase JSON body payload limit to allow Base64 image uploads
 app.use(express.json({ limit: "10mb" }));
-
 app.use(cors({
   origin: "*",
   methods: ["GET", "POST", "OPTIONS"],
@@ -62,7 +60,7 @@ async function authenticate(req, res, next) {
   }
 }
 
-// SSE Real-Time Stream Engine
+// SSE Broadcast Engine
 let sseClients = [];
 function broadcastPFrame(eventType, payload, targetUsernames = null) {
   const dataString = `data: ${JSON.stringify({ frameType: "P-FRAME", type: eventType, payload })}\n\n`;
@@ -75,7 +73,7 @@ function broadcastPFrame(eventType, payload, targetUsernames = null) {
 
 app.get("/", (req, res) => res.send("Chat Backend Online"));
 
-// SSE Stream Setup (Robust Query Logic for Friends & Groups)
+// SSE Stream Setup
 app.get("/api/stream", authenticate, async (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -85,13 +83,11 @@ app.get("/api/stream", authenticate, async (req, res) => {
   sseClients.push(client);
 
   try {
-    // 1. Fetch Groups reliably
     const groupsRes = req.user.role === "admin"
       ? await queryWorker("SELECT * FROM groups")
       : await queryWorker("SELECT g.* FROM groups g JOIN group_members gm ON g.group_token = gm.group_token WHERE gm.username = ?", [req.user.username]);
     const groups = groupsRes.results || [];
 
-    // 2. Fetch Friends reliably
     const friendsRes = await queryWorker("SELECT * FROM friends WHERE user1 = ? OR user2 = ?", [req.user.username, req.user.username]);
     const friendRows = friendsRes.results || [];
 
@@ -125,7 +121,7 @@ app.get("/api/stream", authenticate, async (req, res) => {
   });
 });
 
-// User Account Registration
+// User Auth Routes
 app.post("/api/register", async (req, res) => {
   let { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: "Missing required fields" });
@@ -167,7 +163,7 @@ app.post("/api/login", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Profile Picture Upload (Server-Side 512KB Limit Enforcement)
+// Profile Picture Endpoint
 app.post("/api/user/pfp", authenticate, async (req, res) => {
   const { pfpBase64 } = req.body;
   if (!pfpBase64) return res.status(400).json({ error: "No image provided" });
@@ -212,7 +208,18 @@ app.post("/api/friends/accept", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Group & DM Management
+// Group Member List Lookup (NEW)
+app.get("/api/groups/:groupToken/members", authenticate, async (req, res) => {
+  try {
+    const members = await queryWorker(
+      "SELECT gm.username, u.pfp FROM group_members gm LEFT JOIN users u ON gm.username = u.username WHERE gm.group_token = ?",
+      [req.params.groupToken]
+    );
+    res.json(members.results || []);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Group Creation & In-Group Invites
 app.post("/api/groups/create", authenticate, async (req, res) => {
   const { groupName, memberToken } = req.body;
   if (!groupName) return res.status(400).json({ error: "Group name required" });
@@ -236,7 +243,7 @@ app.post("/api/groups/add-member", authenticate, async (req, res) => {
 
     await queryWorker("INSERT OR REPLACE INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, 'DEFAULT')", [groupToken, targetUsername]);
     broadcastPFrame("GROUP_MEMBER_ADDED", { groupToken, targetUsername }, [targetUsername]);
-    res.json({ message: `${targetUsername} added to group successfully.` });
+    res.json({ message: `${targetUsername} added to group.` });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -263,15 +270,14 @@ app.post("/api/dm/open", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Messages Engine (Text & 1MB Image Attachments)
+// Messages Engine
 app.post("/api/messages/send", authenticate, async (req, res) => {
   const { groupToken, content } = req.body;
   const timestamp = Date.now();
 
-  // Validate image size if sending image attachment
   if (content.startsWith("data:image/")) {
     const byteSize = Buffer.byteLength(content, "utf8");
-    if (byteSize > 1024 * 1024) { // 1MB limit
+    if (byteSize > 1024 * 1024) {
       return res.status(413).json({ error: "Image attachment exceeds 1MB limit." });
     }
   }
