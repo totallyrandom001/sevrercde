@@ -1,175 +1,221 @@
-const express = require('express');
-const cors = require('cors');
+const express = require("express");
+const cors = require("cors");
+const fetch = require("node-fetch");
 
 const app = express();
+app.use(express.json());
+
+// CORS configuration for GitHub Pages Frontend
+app.use(cors({
+  origin: ["https://totallyrandom001.github.io", "http://localhost:3000"],
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
+
+const CF_WORKER_URL = "https://winter-king-b73e.totallyrandom000148932804.workers.dev";
+const WORKER_SECRET = "REPLACE_WITH_SHARED_Backend_SECRET_KEY";
+
+// Helper for Token Calculation (1:1 Interleaving of username & password)
+function generateToken(username, password) {
+  const cleanUser = username.toLowerCase().replace(/[^a-z]/g, "");
+  let token = "";
+  const maxLen = Math.max(cleanUser.length, password.length);
+  for (let i = 0; i < maxLen; i++) {
+    if (i < cleanUser.length) token += cleanUser[i];
+    if (i < password.length) token += password[i];
+  }
+  return token;
+}
+
+// Helper to query Cloudflare Worker
+async function queryWorker(sql, params = []) {
+  const res = await fetch(`${CF_WORKER_URL}/query`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Worker-Secret": WORKER_SECRET
+    },
+    body: JSON.stringify({ sql, params })
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Worker Error: ${text}`);
+  }
+  return await res.json();
+}
+
+// Middleware: Verify Auth Token
+async function authenticate(req, res, next) {
+  const token = req.headers.authorization;
+  if (!token) return res.status(401).json({ error: "Missing token" });
+
+  try {
+    const userRes = await queryWorker("SELECT * FROM users WHERE token = ?", [token]);
+    if (!userRes.results || userRes.results.length === 0) {
+      return res.status(401).json({ error: "Invalid token" });
+    }
+    req.user = userRes.results[0];
+    next();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+// 1. Account Creation Request
+app.post("/api/register", async (req, res) => {
+  let { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ error: "Missing fields" });
+  
+  username = username.toLowerCase().replace(/[^a-z]/g, "");
+  if (!username) return res.status(400).json({ error: "Username must contain valid letters" });
+
+  try {
+    const pendingCountRes = await queryWorker("SELECT COUNT(*) as count FROM pending_accounts");
+    const count = pendingCountRes.results[0].count;
+    if (count >= 5) {
+      return res.status(429).json({ error: "Max pending creation requests reached (5). Try again later." });
+    }
+
+    const token = generateToken(username, password);
+    await queryWorker(
+      "INSERT INTO pending_accounts (username, password, token) VALUES (?, ?, ?)",
+      [username, password, token]
+    );
+
+    res.json({ message: "Account creation request submitted for admin approval." });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2. User Login
+app.post("/api/login", async (req, res) => {
+  let { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ error: "Missing fields" });
+
+  username = username.toLowerCase().replace(/[^a-z]/g, "");
+  const token = generateToken(username, password);
+
+  try {
+    const userRes = await queryWorker("SELECT * FROM users WHERE username = ? AND token = ?", [username, token]);
+    if (!userRes.results || userRes.results.length === 0) {
+      return res.status(401).json({ error: "Invalid credentials or account pending approval." });
+    }
+
+    res.json({ token, username: userRes.results[0].username, role: userRes.results[0].role });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 3. Admin: Get Pending Accounts
+app.get("/api/admin/pending", authenticate, async (req, res) => {
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+  try {
+    const data = await queryWorker("SELECT * FROM pending_accounts");
+    res.json(data.results);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 4. Admin: Approve / Dismiss Request
+app.post("/api/admin/action", authenticate, async (req, res) => {
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+  const { id, action } = req.body; // action: 'approve' or 'deny'
+
+  try {
+    const reqRes = await queryWorker("SELECT * FROM pending_accounts WHERE id = ?", [id]);
+    if (!reqRes.results || reqRes.results.length === 0) return res.status(404).json({ error: "Request not found" });
+
+    const item = reqRes.results[0];
+    if (action === "approve") {
+      await queryWorker("INSERT INTO users (username, token) VALUES (?, ?)", [item.username, item.token]);
+    }
+    await queryWorker("DELETE FROM pending_accounts WHERE id = ?", [id]);
+    res.json({ message: `Account request ${action}d.` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 5. Admin: Delete User Account
+app.post("/api/admin/delete-user", authenticate, async (req, res) => {
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Forbidden" });
+  const { username } = req.body;
+
+  try {
+    await queryWorker("DELETE FROM users WHERE username = ?", [username]);
+    await queryWorker("DELETE FROM group_members WHERE username = ?", [username]);
+    await queryWorker("DELETE FROM friends WHERE user1 = ? OR user2 = ?", [username, username]);
+    res.json({ message: `User ${username} deleted.` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 6. Get Groups
+app.get("/api/groups", authenticate, async (req, res) => {
+  try {
+    if (req.user.role === "admin") {
+      const allGroups = await queryWorker("SELECT * FROM groups");
+      return res.json(allGroups.results);
+    }
+    const myGroups = await queryWorker(
+      "SELECT g.* FROM groups g JOIN group_members gm ON g.group_token = gm.group_token WHERE gm.username = ?",
+      [req.user.username]
+    );
+    res.json(myGroups.results);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 7. Create Group
+app.post("/api/groups/create", authenticate, async (req, res) => {
+  const { groupName, memberToken } = req.body;
+  const groupToken = "grp_" + Math.random().toString(36).substring(2, 10);
+
+  try {
+    await queryWorker("INSERT INTO groups (group_token, group_name, created_by) VALUES (?, ?, ?)", [groupToken, groupName, req.user.username]);
+    await queryWorker("INSERT INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, ?)", [groupToken, req.user.username, memberToken || req.user.token]);
+    res.json({ message: "Group created", groupToken });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 8. Join Group
+app.post("/api/groups/join", authenticate, async (req, res) => {
+  const { groupToken, customMemberToken } = req.body;
+  try {
+    await queryWorker("INSERT OR REPLACE INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, ?)", [groupToken, req.user.username, customMemberToken || req.user.token]);
+    res.json({ message: "Joined group" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 9. Send & Fetch Messages
+app.post("/api/messages/send", authenticate, async (req, res) => {
+  const { groupToken, content } = req.body;
+  try {
+    await queryWorker("INSERT INTO messages (group_token, sender, content, created_at) VALUES (?, ?, ?, ?)", [groupToken, req.user.username, content, Date.now()]);
+    res.json({ message: "Sent" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/messages/:groupToken", authenticate, async (req, res) => {
+  const { groupToken } = req.params;
+  try {
+    const msgs = await queryWorker("SELECT * FROM messages WHERE group_token = ? ORDER BY created_at ASC", [groupToken]);
+    res.json(msgs.results);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
-
-const MAX_MESSAGE_CHARS = 20000;
-const MAX_IMAGE_BASE64_CHARS = 1500000;
-const DELETE_PASSWORD = "sixseven";
-
-const corsOptions = {
-  origin: '*',
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type'],
-  maxAge: 7200
-};
-
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
-app.use(express.json({ limit: '5mb' }));
-
-let clients = [];
-
-async function queryD1(sql, params = []) {
-  const accountId = process.env.CF_ACCOUNT_ID;
-  const databaseId = process.env.CF_DATABASE_ID;
-  const apiToken = process.env.CF_API_TOKEN;
-
-  if (!accountId || !databaseId || !apiToken) {
-    throw new Error("Missing Cloudflare Environment Variables on Render.");
-  }
-
-  const response = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${accountId}/d1/database/${databaseId}/query`,
-    {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiToken}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ sql, params })
-    }
-  );
-
-  const data = await response.json();
-  if (!data.success) {
-    throw new Error(data.errors?.[0]?.message || "Cloudflare D1 Query Failed");
-  }
-
-  const firstResult = data.result?.[0] || {};
-  return {
-    results: firstResult.results || [],
-    lastRowId: firstResult.meta?.last_row_id || null
-  };
-}
-
-function broadcast(data) {
-  const payload = `data: ${JSON.stringify(data)}\n\n`;
-  clients.forEach(client => {
-    try {
-      client.write(payload);
-    } catch (e) {}
-  });
-}
-
-setInterval(() => {
-  clients.forEach(client => {
-    try {
-      client.write(': ping\n\n');
-    } catch (e) {}
-  });
-}, 20000);
-
-app.get('/', (req, res) => {
-  res.json({ status: "ok", message: "Server is running!" });
-});
-
-app.get('/api/stream', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-  res.flushHeaders();
-
-  clients.push(res);
-
-  req.on('close', () => {
-    clients = clients.filter(client => client !== res);
-  });
-});
-
-app.all('/api/delete', async (req, res, next) => {
-  try {
-    const password = req.query.password || (req.body && req.body.password);
-    const chk = String(req.query.chk || (req.body && req.body.chk) || "false").toLowerCase();
-
-    if (password !== DELETE_PASSWORD) {
-      return res.status(403).json({ error: "Yanlış şifre." });
-    }
-
-    if (chk === "true") {
-      await queryD1("DELETE FROM messages");
-      return res.json({ ok: true, message: "Tüm mesajlar silindi." });
-    } else {
-      const thirtyMinsAgo = Date.now() - (30 * 60 * 1000);
-      await queryD1("DELETE FROM messages WHERE created_at < ?", [thirtyMinsAgo]);
-      return res.json({ ok: true, message: "30 dakikadan eski tüm mesajlar silindi." });
-    }
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.post('/api/send', async (req, res, next) => {
-  try {
-    const { name: rawName, message: rawMsg, image: rawImg } = req.body || {};
-    
-    // Convert username to lowercase
-    const name = (rawName || '').toString().trim().toLowerCase().slice(0, 50);
-    const message = (rawMsg || '').toString();
-    const image = rawImg ? rawImg.toString() : null;
-
-    if (!name) return res.status(400).json({ error: 'İsim gerekli.' });
-    if (!message && !image) return res.status(400).json({ error: 'Mesaj veya görsel gerekli.' });
-    if (message.length > MAX_MESSAGE_CHARS) return res.status(400).json({ error: 'Mesaj çok uzun.' });
-    if (image && image.length > MAX_IMAGE_BASE64_CHARS) return res.status(400).json({ error: 'Görsel çok büyük.' });
-
-    const createdAt = Date.now();
-    
-    const { lastRowId } = await queryD1(
-      "INSERT INTO messages (name, message, image, created_at) VALUES (?, ?, ?, ?)",
-      [name, message, image, createdAt]
-    );
-
-    const newMsg = {
-      id: lastRowId,
-      name,
-      message,
-      image,
-      created_at: createdAt
-    };
-
-    broadcast(newMsg);
-
-    return res.json({ ok: true });
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.get('/api/messages', async (req, res, next) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit || '50', 10) || 50, 200);
-    const { results } = await queryD1(
-      "SELECT id, name, message, image, created_at FROM messages ORDER BY id DESC LIMIT ?",
-      [limit]
-    );
-    return res.json({ messages: results.reverse() });
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.use((err, req, res, next) => {
-  console.error("Server Error:", err.message);
-  res.status(500).json({ error: err.message || "Sunucu hatası" });
-});
-
-app.use((req, res) => {
-  res.status(404).json({ error: "Route not found" });
-});
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
