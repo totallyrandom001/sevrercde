@@ -46,12 +46,12 @@ async function queryWorker(sql, params = []) {
 
 async function authenticate(req, res, next) {
   const token = req.headers.authorization || req.query.token;
-  if (!token) return res.status(401).json({ error: "Missing token" });
+  if (!token) return res.status(401).json({ error: "Missing authentication token" });
 
   try {
     const userRes = await queryWorker("SELECT * FROM users WHERE token = ?", [token]);
     if (!userRes.results || userRes.results.length === 0) {
-      return res.status(401).json({ error: "Invalid token" });
+      return res.status(401).json({ error: "Invalid token session" });
     }
     req.user = userRes.results[0];
     next();
@@ -60,7 +60,7 @@ async function authenticate(req, res, next) {
   }
 }
 
-// SSE Broadcast Engine
+// SSE Real-Time Stream Engine
 let sseClients = [];
 function broadcastPFrame(eventType, payload, targetUsernames = null) {
   const dataString = `data: ${JSON.stringify({ frameType: "P-FRAME", type: eventType, payload })}\n\n`;
@@ -121,7 +121,7 @@ app.get("/api/stream", authenticate, async (req, res) => {
   });
 });
 
-// User Auth Routes
+// Registration
 app.post("/api/register", async (req, res) => {
   let { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: "Missing required fields" });
@@ -132,27 +132,29 @@ app.post("/api/register", async (req, res) => {
   try {
     const existingUser = await queryWorker("SELECT username FROM users WHERE username = ?", [username]);
     if (existingUser.results && existingUser.results.length > 0) {
-      return res.status(409).json({ error: "An account with this username already exists." });
+      return res.status(409).json({ error: "An account with this username already exists" });
     }
 
     const existingPending = await queryWorker("SELECT username FROM pending_accounts WHERE username = ?", [username]);
     if (existingPending.results && existingPending.results.length > 0) {
-      return res.status(409).json({ error: "An account creation request for this username is pending approval." });
+      return res.status(409).json({ error: "Creation request for this username is pending" });
     }
 
     const countRes = await queryWorker("SELECT COUNT(*) as count FROM pending_accounts");
     if (countRes.results[0].count >= 5) {
-      return res.status(429).json({ error: "Max 5 pending account requests reached. Try again later." });
+      return res.status(429).json({ error: "Max 5 pending requests allowed" });
     }
 
     const token = generateToken(username, password);
     await queryWorker("INSERT INTO pending_accounts (username, password, token) VALUES (?, ?, ?)", [username, password, token]);
-    res.json({ message: "Account creation request submitted for admin approval." });
+    res.json({ message: "Account creation request submitted successfully" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Login
 app.post("/api/login", async (req, res) => {
   let { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ error: "Enter username and password" });
   username = username.toLowerCase().replace(/[^a-z]/g, "");
   const token = generateToken(username, password);
 
@@ -163,37 +165,50 @@ app.post("/api/login", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Profile Picture Endpoint
+// PFP Upload
 app.post("/api/user/pfp", authenticate, async (req, res) => {
   const { pfpBase64 } = req.body;
   if (!pfpBase64) return res.status(400).json({ error: "No image provided" });
 
   const byteSize = Buffer.byteLength(pfpBase64, "utf8");
   if (byteSize > 512 * 1024) {
-    return res.status(413).json({ error: "Image exceeds 512KB limit." });
+    return res.status(413).json({ error: "Image exceeds 512KB server limit" });
   }
 
   try {
     await queryWorker("UPDATE users SET pfp = ? WHERE username = ?", [pfpBase64, req.user.username]);
     broadcastPFrame("PFP_UPDATED", { username: req.user.username, pfp: pfpBase64 });
-    res.json({ message: "Profile picture updated." });
+    res.json({ message: "Profile picture updated successfully" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Friends Management
 app.post("/api/friends/request", authenticate, async (req, res) => {
   let { targetUsername } = req.body;
+  if (!targetUsername) return res.status(400).json({ error: "Target username required" });
   targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
 
   if (targetUsername === req.user.username) return res.status(400).json({ error: "Cannot add yourself" });
 
   try {
     const checkUser = await queryWorker("SELECT username FROM users WHERE username = ?", [targetUsername]);
-    if (!checkUser.results.length) return res.status(404).json({ error: "User does not exist" });
+    if (!checkUser.results.length) return res.status(404).json({ error: "User could not be found" });
 
-    await queryWorker("INSERT OR IGNORE INTO friends (user1, user2, status) VALUES (?, ?, 'pending')", [req.user.username, targetUsername]);
+    // Check if relationship already exists
+    const checkExisting = await queryWorker(
+      "SELECT * FROM friends WHERE (user1 = ? AND user2 = ?) OR (user1 = ? AND user2 = ?)",
+      [req.user.username, targetUsername, targetUsername, req.user.username]
+    );
+
+    if (checkExisting.results && checkExisting.results.length > 0) {
+      const rel = checkExisting.results[0];
+      if (rel.status === "accepted") return res.status(409).json({ error: "You are already friends with this user" });
+      return res.status(409).json({ error: "Friend request already pending" });
+    }
+
+    await queryWorker("INSERT INTO friends (user1, user2, status) VALUES (?, ?, 'pending')", [req.user.username, targetUsername]);
     broadcastPFrame("FRIEND_REQUEST_SENT", { from: req.user.username, to: targetUsername }, [targetUsername]);
-    res.json({ message: "Friend request sent!" });
+    res.json({ message: "Sent request successfully" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -204,11 +219,25 @@ app.post("/api/friends/accept", authenticate, async (req, res) => {
   try {
     await queryWorker("UPDATE friends SET status = 'accepted' WHERE user1 = ? AND user2 = ?", [targetUsername, req.user.username]);
     broadcastPFrame("FRIEND_ACCEPTED", { user1: targetUsername, user2: req.user.username }, [req.user.username, targetUsername]);
-    res.json({ message: "Friend request accepted!" });
+    res.json({ message: "Accepted friend request" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Group Member List Lookup (NEW)
+app.post("/api/friends/unfriend", authenticate, async (req, res) => {
+  let { targetUsername } = req.body;
+  targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
+
+  try {
+    await queryWorker(
+      "DELETE FROM friends WHERE (user1 = ? AND user2 = ?) OR (user1 = ? AND user2 = ?)",
+      [req.user.username, targetUsername, targetUsername, req.user.username]
+    );
+    broadcastPFrame("FRIEND_REMOVED", { user1: req.user.username, user2: targetUsername }, [req.user.username, targetUsername]);
+    res.json({ message: `Unfriended @${targetUsername}` });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Group & DM Routes
 app.get("/api/groups/:groupToken/members", authenticate, async (req, res) => {
   try {
     const members = await queryWorker(
@@ -219,31 +248,58 @@ app.get("/api/groups/:groupToken/members", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Group Creation & In-Group Invites
 app.post("/api/groups/create", authenticate, async (req, res) => {
-  const { groupName, memberToken } = req.body;
-  if (!groupName) return res.status(400).json({ error: "Group name required" });
+  const { groupName } = req.body;
+  if (!groupName || !groupName.trim()) return res.status(400).json({ error: "Group name is required" });
   const groupToken = "grp_" + Math.random().toString(36).substring(2, 10);
 
   try {
-    await queryWorker("INSERT INTO groups (group_token, group_name, created_by) VALUES (?, ?, ?)", [groupToken, groupName, req.user.username]);
-    await queryWorker("INSERT INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, ?)", [groupToken, req.user.username, memberToken || req.user.token]);
+    await queryWorker("INSERT INTO groups (group_token, group_name, created_by) VALUES (?, ?, ?)", [groupToken, groupName.trim(), req.user.username]);
+    await queryWorker("INSERT INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, ?)", [groupToken, req.user.username, req.user.token]);
     broadcastPFrame("GROUP_CREATED", { group_token: groupToken, group_name: groupName, created_by: req.user.username });
-    res.json({ message: "Group created", groupToken });
+    res.json({ message: "Group created successfully", groupToken });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post("/api/groups/add-member", authenticate, async (req, res) => {
   let { groupToken, targetUsername } = req.body;
+  if (!groupToken || !targetUsername) return res.status(400).json({ error: "Group token and target user required" });
   targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
 
   try {
-    const checkUser = await queryWorker("SELECT username FROM users WHERE username = ?", [targetUsername]);
-    if (!checkUser.results.length) return res.status(404).json({ error: "User does not exist" });
+    // 1. Check if requester is in group or admin
+    if (req.user.role !== "admin") {
+      const isMember = await queryWorker("SELECT * FROM group_members WHERE group_token = ? AND username = ?", [groupToken, req.user.username]);
+      if (!isMember.results || isMember.results.length === 0) {
+        return res.status(403).json({ error: "You are not a member of this group" });
+      }
 
+      // 2. Server Authentication: Must be accepted friends to add to group
+      const isFriend = await queryWorker(
+        "SELECT * FROM friends WHERE ((user1 = ? AND user2 = ?) OR (user1 = ? AND user2 = ?)) AND status = 'accepted'",
+        [req.user.username, targetUsername, targetUsername, req.user.username]
+      );
+
+      if (!isFriend.results || isFriend.results.length === 0) {
+        return res.status(403).json({ error: `Must be accepted friends with @${targetUsername} to add them to a group` });
+      }
+    }
+
+    // 3. Add to group DB
     await queryWorker("INSERT OR REPLACE INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, 'DEFAULT')", [groupToken, targetUsername]);
     broadcastPFrame("GROUP_MEMBER_ADDED", { groupToken, targetUsername }, [targetUsername]);
-    res.json({ message: `${targetUsername} added to group.` });
+    res.json({ message: `Added @${targetUsername} to group` });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/api/groups/leave", authenticate, async (req, res) => {
+  const { groupToken } = req.body;
+  if (!groupToken) return res.status(400).json({ error: "Group token required" });
+
+  try {
+    await queryWorker("DELETE FROM group_members WHERE group_token = ? AND username = ?", [groupToken, req.user.username]);
+    broadcastPFrame("GROUP_MEMBER_LEFT", { groupToken, username: req.user.username });
+    res.json({ message: "Left group successfully" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -270,15 +326,16 @@ app.post("/api/dm/open", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Messages Engine
+// Messaging Engine
 app.post("/api/messages/send", authenticate, async (req, res) => {
   const { groupToken, content } = req.body;
+  if (!groupToken || !content) return res.status(400).json({ error: "Missing message content" });
   const timestamp = Date.now();
 
   if (content.startsWith("data:image/")) {
     const byteSize = Buffer.byteLength(content, "utf8");
     if (byteSize > 1024 * 1024) {
-      return res.status(413).json({ error: "Image attachment exceeds 1MB limit." });
+      return res.status(413).json({ error: "Image attachment exceeds 1MB limit" });
     }
   }
 
@@ -286,7 +343,7 @@ app.post("/api/messages/send", authenticate, async (req, res) => {
     await queryWorker("INSERT INTO messages (group_token, sender, content, created_at) VALUES (?, ?, ?, ?)", [groupToken, req.user.username, content, timestamp]);
     const pFrameData = { group_token: groupToken, sender: req.user.username, content, created_at: timestamp, pfp: req.user.pfp || "" };
     broadcastPFrame("NEW_MESSAGE", pFrameData);
-    res.json({ message: "Sent" });
+    res.json({ message: "Message sent" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
