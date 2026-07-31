@@ -16,6 +16,46 @@ app.options("*", cors());
 const CF_WORKER_URL = "https://winter-king-b73e.totallyrandom000148932804.workers.dev";
 const WORKER_SECRET = process.env.WORKER_SECRET;
 
+// --- In-Memory Rate Limiting Engine ---
+const rateLimitMap = new Map();
+
+/**
+ * Checks and updates rate limits for a given identifier key.
+ * @param {string} key - Unique key per user or IP action
+ * @param {number} windowMs - Time window in milliseconds
+ * @param {number} maxHits - Maximum allowed requests within the window
+ * @returns {{ limited: boolean, retryAfterSec?: number }}
+ */
+function checkRateLimit(key, windowMs, maxHits) {
+  const now = Date.now();
+  if (!rateLimitMap.has(key)) {
+    rateLimitMap.set(key, []);
+  }
+
+  // Filter out timestamps outside the active window
+  const timestamps = rateLimitMap.get(key).filter(ts => now - ts < windowMs);
+
+  if (timestamps.length >= maxHits) {
+    const oldestTimestamp = timestamps[0];
+    const retryAfterMs = windowMs - (now - oldestTimestamp);
+    return { limited: true, retryAfterSec: Math.ceil(retryAfterMs / 1000) };
+  }
+
+  timestamps.push(now);
+  rateLimitMap.set(key, timestamps);
+  return { limited: false };
+}
+
+// Memory Cleanup: Sweep expired entries every 10 minutes to prevent memory leaks
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, timestamps] of rateLimitMap.entries()) {
+    const valid = timestamps.filter(ts => now - ts < 15 * 60 * 1000);
+    if (valid.length === 0) rateLimitMap.delete(key);
+    else rateLimitMap.set(key, valid);
+  }
+}, 10 * 60 * 1000);
+
 function generateToken(username, password) {
   const cleanUser = username.toLowerCase().replace(/[^a-z]/g, "");
   let token = "";
@@ -60,7 +100,7 @@ async function authenticate(req, res, next) {
   }
 }
 
-// SSE Real-Time Stream Engine
+// SSE Clients Registry
 let sseClients = [];
 function broadcastPFrame(eventType, payload, targetUsernames = null) {
   const dataString = `data: ${JSON.stringify({ frameType: "P-FRAME", type: eventType, payload })}\n\n`;
@@ -71,7 +111,42 @@ function broadcastPFrame(eventType, payload, targetUsernames = null) {
   });
 }
 
+async function fetchUserSnapshot(user) {
+  const groupsRes = user.role === "admin"
+    ? await queryWorker("SELECT * FROM groups")
+    : await queryWorker("SELECT g.* FROM groups g JOIN group_members gm ON g.group_token = gm.group_token WHERE gm.username = ?", [user.username]);
+  const groups = groupsRes.results || [];
+
+  const friendsRes = await queryWorker("SELECT * FROM friends WHERE user1 = ? OR user2 = ?", [user.username, user.username]);
+  const friendRows = friendsRes.results || [];
+
+  const usersRes = await queryWorker("SELECT username, pfp FROM users");
+  const userMap = {};
+  (usersRes.results || []).forEach(u => userMap[u.username] = u.pfp || "");
+
+  const friends = friendRows.map(f => {
+    const otherUser = f.user1 === user.username ? f.user2 : f.user1;
+    return {
+      id: f.id,
+      user1: f.user1,
+      user2: f.user2,
+      status: f.status,
+      pfp: userMap[otherUser] || ""
+    };
+  });
+
+  return { groups, friends };
+}
+
 app.get("/", (req, res) => res.send("Chat Backend Online"));
+
+// Snapshot API
+app.get("/api/snapshot", authenticate, async (req, res) => {
+  try {
+    const snapshot = await fetchUserSnapshot(req.user);
+    res.json(snapshot);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 // SSE Stream Setup
 app.get("/api/stream", authenticate, async (req, res) => {
@@ -83,37 +158,14 @@ app.get("/api/stream", authenticate, async (req, res) => {
   sseClients.push(client);
 
   try {
-    const groupsRes = req.user.role === "admin"
-      ? await queryWorker("SELECT * FROM groups")
-      : await queryWorker("SELECT g.* FROM groups g JOIN group_members gm ON g.group_token = gm.group_token WHERE gm.username = ?", [req.user.username]);
-    const groups = groupsRes.results || [];
-
-    const friendsRes = await queryWorker("SELECT * FROM friends WHERE user1 = ? OR user2 = ?", [req.user.username, req.user.username]);
-    const friendRows = friendsRes.results || [];
-
-    const usersRes = await queryWorker("SELECT username, pfp FROM users");
-    const userMap = {};
-    (usersRes.results || []).forEach(u => userMap[u.username] = u.pfp || "");
-
-    const friends = friendRows.map(f => {
-      const otherUser = f.user1 === req.user.username ? f.user2 : f.user1;
-      return {
-        id: f.id,
-        user1: f.user1,
-        user2: f.user2,
-        status: f.status,
-        pfp: userMap[otherUser] || ""
-      };
-    });
-
+    const snapshot = await fetchUserSnapshot(req.user);
     res.write(`data: ${JSON.stringify({
       frameType: "I-FRAME",
       user: { username: req.user.username, role: req.user.role, pfp: req.user.pfp || "" },
-      groups,
-      friends
+      ...snapshot
     })}\n\n`);
   } catch (err) {
-    console.error("Stream I-Frame Error:", err);
+    console.error("Stream Error:", err);
   }
 
   req.on("close", () => {
@@ -121,8 +173,14 @@ app.get("/api/stream", authenticate, async (req, res) => {
   });
 });
 
-// Registration
+// Registration (Rate Limit: 3 attempts per 15 minutes per IP)
 app.post("/api/register", async (req, res) => {
+  const ip = req.headers["x-forwarded-for"] || req.ip || "unknown";
+  const limit = checkRateLimit(`reg_${ip}`, 15 * 60 * 1000, 3);
+  if (limit.limited) {
+    return res.status(429).json({ error: `Too many registration requests. Please wait ${limit.retryAfterSec}s.` });
+  }
+
   let { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: "Missing required fields" });
   username = username.toLowerCase().replace(/[^a-z]/g, "");
@@ -151,8 +209,14 @@ app.post("/api/register", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Login
+// Login (Rate Limit: 5 attempts per 1 minute per IP)
 app.post("/api/login", async (req, res) => {
+  const ip = req.headers["x-forwarded-for"] || req.ip || "unknown";
+  const limit = checkRateLimit(`login_${ip}`, 60 * 1000, 5);
+  if (limit.limited) {
+    return res.status(429).json({ error: `Too many login attempts. Please wait ${limit.retryAfterSec}s.` });
+  }
+
   let { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: "Enter username and password" });
   username = username.toLowerCase().replace(/[^a-z]/g, "");
@@ -165,8 +229,14 @@ app.post("/api/login", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// PFP Upload
+// PFP Upload (Rate Limit: 1 update every 10 minutes per user)
 app.post("/api/user/pfp", authenticate, async (req, res) => {
+  const limit = checkRateLimit(`pfp_${req.user.username}`, 10 * 60 * 1000, 1);
+  if (limit.limited) {
+    const mins = Math.ceil(limit.retryAfterSec / 60);
+    return res.status(429).json({ error: `PFP can only be updated once every 10 minutes. Try again in ${mins} minute(s).` });
+  }
+
   const { pfpBase64 } = req.body;
   if (!pfpBase64) return res.status(400).json({ error: "No image provided" });
 
@@ -182,8 +252,13 @@ app.post("/api/user/pfp", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Friends Management
+// Friends Management (Rate Limit: 5 requests per 1 minute per user)
 app.post("/api/friends/request", authenticate, async (req, res) => {
+  const limit = checkRateLimit(`freq_${req.user.username}`, 60 * 1000, 5);
+  if (limit.limited) {
+    return res.status(429).json({ error: `Sending requests too quickly. Please wait ${limit.retryAfterSec}s.` });
+  }
+
   let { targetUsername } = req.body;
   if (!targetUsername) return res.status(400).json({ error: "Target username required" });
   targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
@@ -192,9 +267,8 @@ app.post("/api/friends/request", authenticate, async (req, res) => {
 
   try {
     const checkUser = await queryWorker("SELECT username FROM users WHERE username = ?", [targetUsername]);
-    if (!checkUser.results.length) return res.status(404).json({ error: "User could not be found" });
+    if (!checkUser.results || !checkUser.results.length) return res.status(404).json({ error: "user could not be found" });
 
-    // Check if relationship already exists
     const checkExisting = await queryWorker(
       "SELECT * FROM friends WHERE (user1 = ? AND user2 = ?) OR (user1 = ? AND user2 = ?)",
       [req.user.username, targetUsername, targetUsername, req.user.username]
@@ -208,7 +282,7 @@ app.post("/api/friends/request", authenticate, async (req, res) => {
 
     await queryWorker("INSERT INTO friends (user1, user2, status) VALUES (?, ?, 'pending')", [req.user.username, targetUsername]);
     broadcastPFrame("FRIEND_REQUEST_SENT", { from: req.user.username, to: targetUsername }, [targetUsername]);
-    res.json({ message: "Sent request successfully" });
+    res.json({ message: "sent request successfully" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -237,7 +311,7 @@ app.post("/api/friends/unfriend", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Group & DM Routes
+// Group & DM Routes (Group Creation Rate Limit: 2 groups per 5 minutes per user)
 app.get("/api/groups/:groupToken/members", authenticate, async (req, res) => {
   try {
     const members = await queryWorker(
@@ -249,6 +323,11 @@ app.get("/api/groups/:groupToken/members", authenticate, async (req, res) => {
 });
 
 app.post("/api/groups/create", authenticate, async (req, res) => {
+  const limit = checkRateLimit(`grp_${req.user.username}`, 5 * 60 * 1000, 2);
+  if (limit.limited) {
+    return res.status(429).json({ error: `You can only create 2 groups every 5 minutes. Try again in ${limit.retryAfterSec}s.` });
+  }
+
   const { groupName } = req.body;
   if (!groupName || !groupName.trim()) return res.status(400).json({ error: "Group name is required" });
   const groupToken = "grp_" + Math.random().toString(36).substring(2, 10);
@@ -267,14 +346,12 @@ app.post("/api/groups/add-member", authenticate, async (req, res) => {
   targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
 
   try {
-    // 1. Check if requester is in group or admin
     if (req.user.role !== "admin") {
       const isMember = await queryWorker("SELECT * FROM group_members WHERE group_token = ? AND username = ?", [groupToken, req.user.username]);
       if (!isMember.results || isMember.results.length === 0) {
         return res.status(403).json({ error: "You are not a member of this group" });
       }
 
-      // 2. Server Authentication: Must be accepted friends to add to group
       const isFriend = await queryWorker(
         "SELECT * FROM friends WHERE ((user1 = ? AND user2 = ?) OR (user1 = ? AND user2 = ?)) AND status = 'accepted'",
         [req.user.username, targetUsername, targetUsername, req.user.username]
@@ -285,7 +362,6 @@ app.post("/api/groups/add-member", authenticate, async (req, res) => {
       }
     }
 
-    // 3. Add to group DB
     await queryWorker("INSERT OR REPLACE INTO group_members (group_token, username, custom_member_token) VALUES (?, ?, 'DEFAULT')", [groupToken, targetUsername]);
     broadcastPFrame("GROUP_MEMBER_ADDED", { groupToken, targetUsername }, [targetUsername]);
     res.json({ message: `Added @${targetUsername} to group` });
@@ -326,8 +402,13 @@ app.post("/api/dm/open", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Messaging Engine
+// Messaging Engine (Rate Limit: Max 5 messages every 3 seconds per user)
 app.post("/api/messages/send", authenticate, async (req, res) => {
+  const limit = checkRateLimit(`msg_${req.user.username}`, 3 * 1000, 5);
+  if (limit.limited) {
+    return res.status(429).json({ error: "You are sending messages too quickly. Please slow down." });
+  }
+
   const { groupToken, content } = req.body;
   if (!groupToken || !content) return res.status(400).json({ error: "Missing message content" });
   const timestamp = Date.now();
