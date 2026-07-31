@@ -7,12 +7,10 @@ const PORT = process.env.PORT || 3000;
 const MAX_MESSAGE_CHARS = 20000;
 const MAX_IMAGE_BASE64_CHARS = 1500000;
 
-// Enable CORS for all routes and preflight requests
 app.use(cors());
 app.options('*', cors());
 app.use(express.json({ limit: '5mb' }));
 
-// Active SSE client connections
 let clients = [];
 
 // Helper function to query Cloudflare D1 via REST API
@@ -42,21 +40,34 @@ async function queryD1(sql, params = []) {
     throw new Error(data.errors?.[0]?.message || "Cloudflare D1 Query Failed");
   }
 
-  return data.result[0]?.results || [];
+  const firstResult = data.result?.[0] || {};
+  return {
+    results: firstResult.results || [],
+    lastRowId: firstResult.meta?.last_row_id || null
+  };
 }
 
 // Broadcast new message to all connected SSE clients
 function broadcast(data) {
   const payload = `data: ${JSON.stringify(data)}\n\n`;
-  clients.forEach(client => client.write(payload));
+  clients.forEach(client => {
+    try {
+      client.write(payload);
+    } catch (e) {
+      // Ignore dead connection writes
+    }
+  });
 }
 
-// Keep-alive ping every 25 seconds (prevents Render/proxies from closing idle stream)
+// Keep-alive ping every 20 seconds
 setInterval(() => {
-  clients.forEach(client => client.write(': ping\n\n'));
-}, 25000);
+  clients.forEach(client => {
+    try {
+      client.write(': ping\n\n');
+    } catch (e) {}
+  });
+}, 20000);
 
-// Health check endpoint
 app.get('/', (req, res) => {
   res.json({ status: "ok", message: "Server is running!" });
 });
@@ -64,8 +75,9 @@ app.get('/', (req, res) => {
 // SSE Real-Time Stream Endpoint
 app.get('/api/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // Prevents Render proxy from buffering SSE messages
   res.flushHeaders();
 
   clients.push(res);
@@ -84,28 +96,28 @@ app.post('/api/send', async (req, res, next) => {
     const message = (rawMsg || '').toString();
     const image = rawImg ? rawImg.toString() : null;
 
-    if (!name) {
-      return res.status(400).json({ error: 'İsim gerekli.' });
-    }
-    if (!message && !image) {
-      return res.status(400).json({ error: 'Mesaj veya görsel gerekli.' });
-    }
-    if (message.length > MAX_MESSAGE_CHARS) {
-      return res.status(400).json({ error: 'Mesaj çok uzun.' });
-    }
-    if (image && image.length > MAX_IMAGE_BASE64_CHARS) {
-      return res.status(400).json({ error: 'Görsel çok büyük.' });
-    }
+    if (!name) return res.status(400).json({ error: 'İsim gerekli.' });
+    if (!message && !image) return res.status(400).json({ error: 'Mesaj veya görsel gerekli.' });
+    if (message.length > MAX_MESSAGE_CHARS) return res.status(400).json({ error: 'Mesaj çok uzun.' });
+    if (image && image.length > MAX_IMAGE_BASE64_CHARS) return res.status(400).json({ error: 'Görsel çok büyük.' });
 
     const createdAt = Date.now();
-    const inserted = await queryD1(
-      "INSERT INTO messages (name, message, image, created_at) VALUES (?, ?, ?, ?) RETURNING id, name, message, image, created_at",
+    
+    // Save to D1 and capture generated last_row_id
+    const { lastRowId } = await queryD1(
+      "INSERT INTO messages (name, message, image, created_at) VALUES (?, ?, ?, ?)",
       [name, message, image, createdAt]
     );
 
-    const newMsg = inserted[0] || { name, message, image, created_at: createdAt };
+    const newMsg = {
+      id: lastRowId,
+      name,
+      message,
+      image,
+      created_at: createdAt
+    };
 
-    // Push new message instantly to all connected users
+    // Push new message instantly with its valid ID
     broadcast(newMsg);
 
     return res.json({ ok: true });
@@ -118,7 +130,7 @@ app.post('/api/send', async (req, res, next) => {
 app.get('/api/messages', async (req, res, next) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || '50', 10) || 50, 200);
-    const results = await queryD1(
+    const { results } = await queryD1(
       "SELECT id, name, message, image, created_at FROM messages ORDER BY id DESC LIMIT ?",
       [limit]
     );
@@ -128,13 +140,11 @@ app.get('/api/messages', async (req, res, next) => {
   }
 });
 
-// Global Error Handler
 app.use((err, req, res, next) => {
   console.error("Server Error:", err.message);
   res.status(500).json({ error: err.message || "Sunucu hatası" });
 });
 
-// 404 Handler
 app.use((req, res) => {
   res.status(404).json({ error: "Route not found" });
 });
