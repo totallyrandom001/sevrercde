@@ -1,6 +1,6 @@
 {
   "name": "sopert-server",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "main": "server.js",
   "scripts": {
@@ -10,6 +10,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "better-sqlite3": "^9.6.0",
     "express": "^4.19.2"
   }
 }
