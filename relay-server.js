@@ -1,10 +1,15 @@
 // ============================================================================
 // SOPERT RELAY — deployed on Render.
-// Browser (GitHub Pages) -> this relay -> whatever Cloudflare quick-tunnel
-// URL the VAIO last registered -> VAIO's local server.
+// Browser (GitHub Pages) -> this relay -> the VAIO's Tailscale Funnel hostname
+// (fixed, doesn't rotate) -> VAIO's local server.
 //
 // Env vars required on Render:
-//   RELAY_SECRET     shared secret the VAIO uses to register its tunnel URL
+//   TUNNEL_URL        your Tailscale Funnel hostname, e.g.
+//                      https://your-machine.your-tailnet.ts.net
+//   RELAY_SECRET      shared secret, still used to auth the optional manual
+//                      /register-tunnel override below (kept for convenience
+//                      if you ever need to point at a different URL without
+//                      redeploying, but TUNNEL_URL is the normal source of truth)
 //   ALLOWED_ORIGIN    (optional) defaults to https://totallyrandom001.github.io
 // ============================================================================
 
@@ -17,15 +22,22 @@ const { createProxyMiddleware } = require("http-proxy-middleware");
 const PORT           = process.env.PORT || 10000;
 const RELAY_SECRET   = process.env.RELAY_SECRET;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "https://totallyrandom001.github.io";
-const STALE_MS       = 6 * 60 * 1000; // if VAIO hasn't re-registered in 6 min, treat as offline
 
 if (!RELAY_SECRET) {
   console.error("FATAL: RELAY_SECRET env var must be set on Render.");
   process.exit(1);
 }
+if (!process.env.TUNNEL_URL) {
+  console.error("FATAL: TUNNEL_URL env var must be set on Render (your ngrok static domain).");
+  process.exit(1);
+}
 
-let tunnelUrl      = null;
-let lastRegistered = 0;
+// Fixed by default — ngrok's free static domain doesn't rotate, so there's
+// no staleness/expiry concept anymore. /register-tunnel can still override
+// this at runtime if you ever need to (e.g. temporarily testing a different
+// tunnel), but nothing goes "stale" the way quick-tunnel URLs used to.
+let tunnelUrl = process.env.TUNNEL_URL.replace(/\/$/, "");
+console.log("[relay] using fixed tunnel ->", tunnelUrl);
 
 const app = express();
 app.set("trust proxy", 1);
@@ -51,27 +63,26 @@ app.use((req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// Tunnel registration (called by run.js on the VAIO every time it (re)starts,
-// and every 4 minutes while running)
+// Manual override (optional) — normally unused now that TUNNEL_URL is fixed.
+// Useful if you ever need to hot-swap the tunnel without a Render redeploy.
 // ---------------------------------------------------------------------------
 app.post("/register-tunnel", express.json(), (req, res) => {
   const { url, secret } = req.body || {};
   if (secret !== RELAY_SECRET) return res.status(403).json({ error: "bad secret" });
-  if (!url || !/^https:\/\/[a-z0-9-]+\.trycloudflare\.com\/?$/.test(url)) {
+  if (!url || !/^https:\/\/[a-z0-9.-]+$/.test(url.replace(/\/$/, ""))) {
     return res.status(400).json({ error: "bad url" });
   }
-  tunnelUrl      = url.replace(/\/$/, "");
-  lastRegistered = Date.now();
-  console.log("[relay] tunnel registered ->", tunnelUrl);
+  tunnelUrl = url.replace(/\/$/, "");
+  console.log("[relay] tunnel manually overridden ->", tunnelUrl);
   res.json({ ok: true });
 });
 
 app.get("/relay-status", (req, res) => {
-  const connected = !!tunnelUrl && Date.now() - lastRegistered < STALE_MS;
-  res.json({
-    connected,
-    lastRegisteredSecondsAgo: tunnelUrl ? Math.floor((Date.now() - lastRegistered) / 1000) : null,
-  });
+  // With a fixed ngrok static domain there's no registration heartbeat to
+  // measure staleness against — this just reports what URL is configured.
+  // Actual reachability is only known when a real proxied request succeeds
+  // or fails (see the 502 handlers below).
+  res.json({ connected: true, tunnelUrl });
 });
 
 // ---------------------------------------------------------------------------
@@ -86,11 +97,13 @@ app.use(rateLimit({
 }));
 
 // ---------------------------------------------------------------------------
-// Refuse to proxy if we don't have a live tunnel
+// Refuse to proxy if we don't have a tunnel URL configured at all.
+// Actual reachability failures (tunnel down, VAIO offline) surface as 502s
+// from the proxy error handlers below, not from this check.
 // ---------------------------------------------------------------------------
 function requireTunnel(req, res, next) {
-  if (!tunnelUrl || Date.now() - lastRegistered > STALE_MS) {
-    return res.status(503).json({ error: "VAIO şu anda bağlı değil" });
+  if (!tunnelUrl) {
+    return res.status(503).json({ error: "VAIO tüneli yapılandırılmamış" });
   }
   next();
 }
@@ -131,6 +144,19 @@ app.get("/api/stream", requireTunnel, (req, res) => {
       headers:  proxyHeaders,
     },
     (proxyRes) => {
+      // If the tunnel itself is down, ngrok/the network layer returns a
+      // non-2xx status with an HTML error body instead of a real SSE stream.
+      // Piping that through as if it were valid would leave the browser's
+      // EventSource silently stuck (exactly what happened with Cloudflare's
+      // error 530 earlier) — so bail out with a clean JSON error instead.
+      if (proxyRes.statusCode < 200 || proxyRes.statusCode >= 300) {
+        console.error(`[relay] SSE upstream returned non-2xx: ${proxyRes.statusCode}`);
+        proxyRes.resume(); // drain and discard the error body
+        setCors(req, res);
+        res.status(502).json({ error: "VAIO tüneli şu anda ulaşılamıyor" });
+        return;
+      }
+
       // Build response headers: keep upstream headers, strip upstream CORS
       // (our middleware already set the correct CORS headers above), and
       // add explicit no-buffering directives for Render's infrastructure.
