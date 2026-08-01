@@ -47,57 +47,19 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000);
 
-// Veritabanı Toplam Boyutunu Bayt Cinsinden Hesaplar
-async function getDbSizeBytes() {
-  try {
-    const countRes = await queryWorker("PRAGMA page_count;");
-    const sizeRes = await queryWorker("PRAGMA page_size;");
-    const pageCount = countRes.results?.[0]?.page_count || 0;
-    const pageSize = sizeRes.results?.[0]?.page_size || 4096;
-    return pageCount * pageSize;
-  } catch (err) {
-    console.error("DB Boyutu sorgulama hatası:", err.message);
-    return 0;
-  }
-}
-
-// 250MB Kayan Pencere (Rolling Window) Kademeli Temizlik Algoritması
+// Otomatik Temizlik: 30 günden eski mesajları ve 24 saatten eski görselleri temizler
 async function cleanupOldMessages() {
   try {
-    const MAX_ALLOWED_BYTES = 250 * 1024 * 1024; // 250 MB
-    let currentDbSize = await getDbSizeBytes();
+    const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
+    const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
 
-    // Eğer boyut 250MB sınırının altındaysa işlem yapma
-    if (currentDbSize <= MAX_ALLOWED_BYTES) return;
-
-    const now = Date.now();
-    const steps = [
-      // 1. Adım: 24 saatten eski fotoğraflar
-      `DELETE FROM messages WHERE content LIKE 'data:image/%' AND created_at < ${now - (24 * 60 * 60 * 1000)}`,
-      // 2. Adım: 24 saatten eski mesajlar
-      `DELETE FROM messages WHERE created_at < ${now - (24 * 60 * 60 * 1000)}`,
-      // 3. Adım: 12 saatten eski fotoğraflar
-      `DELETE FROM messages WHERE content LIKE 'data:image/%' AND created_at < ${now - (12 * 60 * 60 * 1000)}`,
-      // 4. Adım: 12 saatten eski mesajlar
-      `DELETE FROM messages WHERE created_at < ${now - (12 * 60 * 60 * 1000)}`,
-      // 5. Adım: 5 saatten eski fotoğraflar ve mesajlar
-      `DELETE FROM messages WHERE created_at < ${now - (5 * 60 * 60 * 1000)}`
-    ];
-
-    for (const sql of steps) {
-      await queryWorker(sql);
-      currentDbSize = await getDbSizeBytes();
-      if (currentDbSize <= MAX_ALLOWED_BYTES) {
-        console.log(`DB Boyutu ${Math.round(currentDbSize / (1024 * 1024))}MB seviyesine düşürüldü. Temizlik tamamlandı.`);
-        break;
-      }
-    }
+    await queryWorker("DELETE FROM messages WHERE created_at < ?", [thirtyDaysAgo]);
+    await queryWorker("DELETE FROM messages WHERE content LIKE 'data:image/%' AND created_at < ?", [twentyFourHoursAgo]);
   } catch (err) {
-    console.error("Kademeli veritabanı temizleme hatası:", err.message);
+    console.error("Otomatik mesaj temizleme hatası:", err.message);
   }
 }
 
-// Her 1 saatte bir veritabanı boyut kontrolünü ve temizliğini çalıştırır
 setInterval(cleanupOldMessages, 60 * 60 * 1000);
 cleanupOldMessages();
 
@@ -145,6 +107,20 @@ async function authenticate(req, res, next) {
   }
 }
 
+// Grubun Üyelerini ve Yönetici Listesini Getiren Yardımcı Fonksiyon
+async function getGroupMemberUsernames(groupToken) {
+  try {
+    const res = await queryWorker(
+      "SELECT DISTINCT username FROM group_members WHERE group_token = ? UNION SELECT username FROM users WHERE role = 'admin'",
+      [groupToken]
+    );
+    return (res.results || []).map(r => r.username);
+  } catch (err) {
+    console.error("Grup üyeleri getirilirken hata:", err);
+    return [];
+  }
+}
+
 // SSE Clients Registry
 let sseClients = [];
 function broadcastPFrame(eventType, payload, targetUsernames = null) {
@@ -158,8 +134,8 @@ function broadcastPFrame(eventType, payload, targetUsernames = null) {
 
 async function fetchUserSnapshot(user) {
   const groupsRes = user.role === "admin"
-    ? await queryWorker("SELECT id, group_token, group_name, created_by, allow_sub_invites FROM groups ORDER BY id ASC")
-    : await queryWorker("SELECT g.id, g.group_token, g.group_name, g.created_by, g.allow_sub_invites FROM groups g JOIN group_members gm ON g.group_token = gm.group_token WHERE gm.username = ? ORDER BY g.id ASC", [user.username]);
+    ? await queryWorker("SELECT * FROM groups")
+    : await queryWorker("SELECT g.* FROM groups g JOIN group_members gm ON g.group_token = gm.group_token WHERE gm.username = ?", [user.username]);
   const groups = groupsRes.results || [];
 
   const friendsRes = await queryWorker("SELECT * FROM friends WHERE user1 = ? OR user2 = ?", [user.username, user.username]);
@@ -425,7 +401,9 @@ app.post("/api/groups/create", authenticate, async (req, res) => {
   try {
     await queryWorker("INSERT INTO groups (group_token, group_name, created_by, allow_sub_invites) VALUES (?, ?, ?, 1)", [groupToken, groupName.trim(), req.user.username]);
     await queryWorker("INSERT INTO group_members (group_token, username, custom_member_token, can_add_members, invited_by) VALUES (?, ?, ?, 1, ?)", [groupToken, req.user.username, req.user.token, req.user.username]);
-    broadcastPFrame("GROUP_CREATED", { group_token: groupToken, group_name: groupName, created_by: req.user.username });
+    
+    const targetUsers = await getGroupMemberUsernames(groupToken);
+    broadcastPFrame("GROUP_CREATED", { group_token: groupToken, group_name: groupName, created_by: req.user.username }, targetUsers);
     res.json({ message: "Grup başarıyla oluşturuldu", groupToken });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -476,7 +454,9 @@ app.post("/api/groups/add-member", authenticate, async (req, res) => {
     }
 
     await queryWorker("INSERT OR REPLACE INTO group_members (group_token, username, custom_member_token, can_add_members, invited_by) VALUES (?, ?, 'DEFAULT', 1, ?)", [groupToken, targetUsername, req.user.username]);
-    broadcastPFrame("GROUP_MEMBER_ADDED", { groupToken, targetUsername }, [targetUsername]);
+    
+    const targetUsers = await getGroupMemberUsernames(groupToken);
+    broadcastPFrame("GROUP_MEMBER_ADDED", { groupToken, targetUsername }, targetUsers);
     res.json({ message: `@${targetUsername} gruba eklendi` });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -503,8 +483,17 @@ app.post("/api/groups/remove-member", authenticate, async (req, res) => {
       return res.status(400).json({ error: "Grup kurucusu gruptan çıkarılamaz" });
     }
 
+    const targetUsers = await getGroupMemberUsernames(groupToken);
     await queryWorker("DELETE FROM group_members WHERE group_token = ? AND username = ?", [groupToken, targetUsername]);
-    broadcastPFrame("GROUP_MEMBER_LEFT", { groupToken, username: targetUsername });
+    
+    // KONTROL: Eğer grupta hiç üye kalmadıysa grubu ve mesajlarını sil
+    const remainingMembers = await queryWorker("SELECT username FROM group_members WHERE group_token = ?", [groupToken]);
+    if (!remainingMembers.results || remainingMembers.results.length === 0) {
+      await queryWorker("DELETE FROM groups WHERE group_token = ?", [groupToken]);
+      await queryWorker("DELETE FROM messages WHERE group_token = ?", [groupToken]);
+    }
+
+    broadcastPFrame("GROUP_MEMBER_LEFT", { groupToken, username: targetUsername }, targetUsers);
     res.json({ message: `@${targetUsername} gruptan çıkarıldı` });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -528,7 +517,8 @@ app.post("/api/groups/toggle-member-invite-perm", authenticate, async (req, res)
     const newPerm = canAddMembers ? 1 : 0;
     await queryWorker("UPDATE group_members SET can_add_members = ? WHERE group_token = ? AND username = ?", [newPerm, groupToken, targetUsername]);
 
-    broadcastPFrame("GROUP_PERM_UPDATED", { groupToken, targetUsername, canAddMembers: newPerm });
+    const targetUsers = await getGroupMemberUsernames(groupToken);
+    broadcastPFrame("GROUP_PERM_UPDATED", { groupToken, targetUsername, canAddMembers: newPerm }, targetUsers);
     res.json({ message: "Üye izni güncellendi" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -552,7 +542,8 @@ app.post("/api/groups/toggle-sub-invites", authenticate, async (req, res) => {
     const newVal = allowSubInvites ? 1 : 0;
     await queryWorker("UPDATE groups SET allow_sub_invites = ? WHERE group_token = ?", [newVal, groupToken]);
 
-    broadcastPFrame("GROUP_SETTING_UPDATED", { groupToken, allowSubInvites: newVal });
+    const targetUsers = await getGroupMemberUsernames(groupToken);
+    broadcastPFrame("GROUP_SETTING_UPDATED", { groupToken, allowSubInvites: newVal }, targetUsers);
     res.json({ message: "Grup davet ilkesi güncellendi" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -565,23 +556,25 @@ app.post("/api/groups/leave", authenticate, async (req, res) => {
   if (!groupToken) return res.status(400).json({ error: "Grup jetonu gerekli" });
 
   try {
+    const targetUsers = await getGroupMemberUsernames(groupToken);
     await queryWorker("DELETE FROM group_members WHERE group_token = ? AND username = ?", [groupToken, req.user.username]);
 
     const remainingMembers = await queryWorker("SELECT username FROM group_members WHERE group_token = ?", [groupToken]);
     const groupRes = await queryWorker("SELECT created_by FROM groups WHERE group_token = ?", [groupToken]);
 
-    if (groupRes.results && groupRes.results.length > 0) {
+    // KONTROL: Eğer üye sayısı 0'a düştüyse grubu ve mesajları tamamen sil
+    if (!remainingMembers.results || remainingMembers.results.length === 0) {
+      await queryWorker("DELETE FROM groups WHERE group_token = ?", [groupToken]);
+      await queryWorker("DELETE FROM messages WHERE group_token = ?", [groupToken]);
+    } else if (groupRes.results && groupRes.results.length > 0) {
       const group = groupRes.results[0];
-      if (!remainingMembers.results || remainingMembers.results.length === 0) {
-        await queryWorker("DELETE FROM groups WHERE group_token = ?", [groupToken]);
-        await queryWorker("DELETE FROM messages WHERE group_token = ?", [groupToken]);
-      } else if (group.created_by === req.user.username) {
+      if (group.created_by === req.user.username) {
         const nextOwner = remainingMembers.results[0].username;
         await queryWorker("UPDATE groups SET created_by = ? WHERE group_token = ?", [nextOwner, groupToken]);
       }
     }
 
-    broadcastPFrame("GROUP_MEMBER_LEFT", { groupToken, username: req.user.username });
+    broadcastPFrame("GROUP_MEMBER_LEFT", { groupToken, username: req.user.username }, targetUsers);
     res.json({ message: "Gruptan başarıyla ayrılındı" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -612,7 +605,7 @@ app.post("/api/dm/open", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Messaging Engine (Gönderme - 1MB Sınırı Sunucu Kontrolü)
+// Messaging Engine
 app.post("/api/messages/send", authenticate, async (req, res) => {
   const limit = checkRateLimit(`msg_${req.user.username}`, 3 * 1000, 5);
   if (limit.limited) {
@@ -633,7 +626,7 @@ app.post("/api/messages/send", authenticate, async (req, res) => {
 
     if (content.startsWith("data:image/")) {
       const byteSize = Buffer.byteLength(content, "utf8");
-      const MAX_BYTES = 1024 * 1024; // 1 MB
+      const MAX_BYTES = 1024 * 1024;
       if (byteSize > MAX_BYTES) {
         return res.status(413).json({ error: "Görsel eki 1MB sınırını aşıyor!" });
       }
@@ -654,7 +647,8 @@ app.post("/api/messages/send", authenticate, async (req, res) => {
       pfp: req.user.pfp || ""
     };
 
-    broadcastPFrame("NEW_MESSAGE", pFrameData);
+    const targetUsers = await getGroupMemberUsernames(groupToken);
+    broadcastPFrame("NEW_MESSAGE", pFrameData, targetUsers);
     res.json({ message: "Mesaj gönderildi" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -690,7 +684,8 @@ app.post("/api/messages/delete", authenticate, async (req, res) => {
       await queryWorker("DELETE FROM messages WHERE group_token = ? AND sender = ? AND created_at = ?", [groupToken, req.user.username, createdAt]);
     }
 
-    broadcastPFrame("MESSAGE_DELETED", { groupToken: msg.group_token, messageId: msg.id, createdAt: msg.created_at });
+    const targetUsers = await getGroupMemberUsernames(msg.group_token);
+    broadcastPFrame("MESSAGE_DELETED", { groupToken: msg.group_token, messageId: msg.id, createdAt: msg.created_at }, targetUsers);
     res.json({ message: "Mesaj başarıyla silindi" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -756,4 +751,4 @@ app.post("/api/admin/delete-user", authenticate, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`SOPERT Sunucusu ${PORT} portunda çevreliçi`));
+app.listen(PORT, () => console.log(`SOPERT Sunucusu ${PORT} portunda çevrimiçi`));
