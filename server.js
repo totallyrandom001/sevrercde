@@ -32,6 +32,29 @@ const path = require("path");
 
 const PORT = process.env.PORT || 3000;
 const app = express();
+
+// ---------------------------------------------------------------------------
+// CORS — the client is served from GitHub Pages (a different origin than
+// this API), so the browser requires an explicit allow-list. Kept tight to
+// known origins rather than "*" since requests carry an Authorization header.
+// ---------------------------------------------------------------------------
+const ALLOWED_ORIGINS = [
+  "https://totallyrandom001.github.io",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+];
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 app.use(express.json({ limit: "2mb" })); // images are base64, capped client-side at 1MB -> ~1.4MB b64
 
 const db = new Database(path.join(__dirname, "sopert.db"));
