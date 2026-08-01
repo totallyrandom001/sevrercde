@@ -47,11 +47,11 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000);
 
-// Zaman Bazlı Yedek Temizlik (24 saatten eski görselleri IMGDB'den temizler)
+// Zaman Bazlı Yedek Temizlik (24 saatten eski görselleri imgdb'den temizler)
 async function cleanupOldImageRecords() {
   try {
     const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
-    await queryWorker("DELETE FROM images WHERE created_at < ?", [twentyFourHoursAgo], "IMGDB");
+    await queryWorker("DELETE FROM images WHERE created_at < ?", [twentyFourHoursAgo], "imgdb");
     await queryWorker("DELETE FROM messages WHERE content LIKE 'img_ref:%' AND created_at < ?", [twentyFourHoursAgo], "DB");
   } catch (err) {
     console.error("Zaman bazlı görsel temizliği hatası:", err.message);
@@ -71,7 +71,6 @@ function generateToken(username, password) {
   return token;
 }
 
-// Çift Veritabanı Destekli Query Fonksiyonu (targetDb: "DB" veya "IMGDB")
 async function queryWorker(sql, params = [], targetDb = "DB") {
   if (!WORKER_SECRET) throw new Error("WORKER_SECRET environment variable is missing!");
   const res = await fetch(`${CF_WORKER_URL}/query`, {
@@ -118,11 +117,10 @@ async function getGroupMemberUsernames(groupToken) {
   }
 }
 
-// Görsel Referanslarını Gerçek Base64 Verisine Dönüştüren Yardımcı Fonksiyon
 async function resolveImageContent(content) {
   if (content && content.startsWith("img_ref:")) {
     const imageId = content.replace("img_ref:", "");
-    const imgRes = await queryWorker("SELECT base64_data FROM images WHERE id = ?", [imageId], "IMGDB");
+    const imgRes = await queryWorker("SELECT base64_data FROM images WHERE id = ?", [imageId], "imgdb");
     if (imgRes.results && imgRes.results.length > 0) {
       return imgRes.results[0].base64_data;
     }
@@ -131,7 +129,28 @@ async function resolveImageContent(content) {
   return content;
 }
 
-// SSE Clients Registry
+// Bir grup tamamen silinirken gruba ait tüm görselleri ve mesajları temizleyen yardımcı fonksiyon
+async function purgeGroupCompletely(groupToken) {
+  try {
+    // 1. Gruba ait mesajlardaki görselleri bul ve imgdb'den sil
+    const msgsRes = await queryWorker("SELECT content FROM messages WHERE group_token = ?", [groupToken], "DB");
+    if (msgsRes.results) {
+      for (const m of msgsRes.results) {
+        if (m.content && m.content.startsWith("img_ref:")) {
+          const imgId = m.content.replace("img_ref:", "");
+          await queryWorker("DELETE FROM images WHERE id = ?", [imgId], "imgdb");
+        }
+      }
+    }
+    // 2. Mesajları, üyeleri ve grubu ana DB'den sil
+    await queryWorker("DELETE FROM messages WHERE group_token = ?", [groupToken], "DB");
+    await queryWorker("DELETE FROM group_members WHERE group_token = ?", [groupToken], "DB");
+    await queryWorker("DELETE FROM groups WHERE group_token = ?", [groupToken], "DB");
+  } catch (err) {
+    console.error(`Grup ${groupToken} temizlenirken hata:`, err.message);
+  }
+}
+
 let sseClients = [];
 function broadcastPFrame(eventType, payload, targetUsernames = null) {
   const dataString = `data: ${JSON.stringify({ frameType: "P-FRAME", type: eventType, payload })}\n\n`;
@@ -171,7 +190,6 @@ async function fetchUserSnapshot(user) {
 
 app.get("/", (req, res) => res.send("SOPERT Backend Online"));
 
-// Snapshot API
 app.get("/api/snapshot", authenticate, async (req, res) => {
   try {
     const snapshot = await fetchUserSnapshot(req.user);
@@ -179,7 +197,6 @@ app.get("/api/snapshot", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// SSE Stream Setup
 app.get("/api/stream", authenticate, async (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -204,7 +221,6 @@ app.get("/api/stream", authenticate, async (req, res) => {
   });
 });
 
-// PUBLIC: View Account Requests
 app.get("/api/public/account-requests", async (req, res) => {
   const ip = req.headers["x-forwarded-for"] || req.ip || "unknown";
   const limit = checkRateLimit(`pub_req_${ip}`, 60 * 1000, 15);
@@ -223,7 +239,6 @@ app.get("/api/public/account-requests", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Registration
 app.post("/api/register", async (req, res) => {
   const ip = req.headers["x-forwarded-for"] || req.ip || "unknown";
   const limit = checkRateLimit(`reg_${ip}`, 15 * 60 * 1000, 3);
@@ -259,7 +274,6 @@ app.post("/api/register", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Login
 app.post("/api/login", async (req, res) => {
   const ip = req.headers["x-forwarded-for"] || req.ip || "unknown";
   const limit = checkRateLimit(`login_${ip}`, 60 * 1000, 5);
@@ -279,7 +293,6 @@ app.post("/api/login", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// PFP Upload
 app.post("/api/user/pfp", authenticate, async (req, res) => {
   const limit = checkRateLimit(`pfp_${req.user.username}`, 10 * 60 * 1000, 1);
   if (limit.limited) {
@@ -302,7 +315,6 @@ app.post("/api/user/pfp", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Friends Management
 app.post("/api/friends/request", authenticate, async (req, res) => {
   const limit = checkRateLimit(`freq_${req.user.username}`, 60 * 1000, 5);
   if (limit.limited) {
@@ -367,7 +379,6 @@ app.post("/api/friends/unfriend", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Group & DM Routes
 app.get("/api/groups/:groupToken/members", authenticate, async (req, res) => {
   const limit = checkRateLimit(`gmembers_${req.user.username}`, 60 * 1000, 30);
   if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
@@ -496,11 +507,10 @@ app.post("/api/groups/remove-member", authenticate, async (req, res) => {
     const targetUsers = await getGroupMemberUsernames(groupToken);
     await queryWorker("DELETE FROM group_members WHERE group_token = ? AND username = ?", [groupToken, targetUsername]);
     
-    // Grupta hiç üye kalmadıysa grubu sil
+    // ÇÖP TOPLAMA: Eğer grupta üye kalmadıysa tüm grup verisini ve görsellerini yok et
     const remainingMembers = await queryWorker("SELECT username FROM group_members WHERE group_token = ?", [groupToken]);
     if (!remainingMembers.results || remainingMembers.results.length === 0) {
-      await queryWorker("DELETE FROM groups WHERE group_token = ?", [groupToken]);
-      await queryWorker("DELETE FROM messages WHERE group_token = ?", [groupToken]);
+      await purgeGroupCompletely(groupToken);
     }
 
     broadcastPFrame("GROUP_MEMBER_LEFT", { groupToken, username: targetUsername }, targetUsers);
@@ -572,9 +582,9 @@ app.post("/api/groups/leave", authenticate, async (req, res) => {
     const remainingMembers = await queryWorker("SELECT username FROM group_members WHERE group_token = ?", [groupToken]);
     const groupRes = await queryWorker("SELECT created_by FROM groups WHERE group_token = ?", [groupToken]);
 
+    // ÇÖP TOPLAMA: Üye sayısı 0'a düştüyse grubu ve içeriğini tamamen sil
     if (!remainingMembers.results || remainingMembers.results.length === 0) {
-      await queryWorker("DELETE FROM groups WHERE group_token = ?", [groupToken]);
-      await queryWorker("DELETE FROM messages WHERE group_token = ?", [groupToken]);
+      await purgeGroupCompletely(groupToken);
     } else if (groupRes.results && groupRes.results.length > 0) {
       const group = groupRes.results[0];
       if (group.created_by === req.user.username) {
@@ -614,7 +624,6 @@ app.post("/api/dm/open", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Messaging Engine (Görseller IMGDB'ye, Referansı Ana DB'ye Kaydedilir)
 app.post("/api/messages/send", authenticate, async (req, res) => {
   const limit = checkRateLimit(`msg_${req.user.username}`, 3 * 1000, 5);
   if (limit.limited) {
@@ -635,7 +644,6 @@ app.post("/api/messages/send", authenticate, async (req, res) => {
 
     let finalContent = content;
 
-    // Eğer Gönderilen İçerik Görsel İse: Görseli IMGDB'ye Yaz, Referansı Ana DB'ye Koy
     if (content.startsWith("data:image/")) {
       const byteSize = Buffer.byteLength(content, "utf8");
       const MAX_BYTES = 1024 * 1024;
@@ -644,7 +652,7 @@ app.post("/api/messages/send", authenticate, async (req, res) => {
       }
 
       const imgId = "img_" + Math.random().toString(36).substring(2, 12) + "_" + timestamp;
-      await queryWorker("INSERT INTO images (id, base64_data, created_at) VALUES (?, ?, ?)", [imgId, content, timestamp], "IMGDB");
+      await queryWorker("INSERT INTO images (id, base64_data, created_at) VALUES (?, ?, ?)", [imgId, content, timestamp], "imgdb");
       finalContent = `img_ref:${imgId}`;
     }
 
@@ -654,7 +662,6 @@ app.post("/api/messages/send", authenticate, async (req, res) => {
       "DB"
     );
 
-    // Canlı Yayın (SSE) İçin Görsel Referansı Çözülür ve Kullanıcıya Base64 Olarak Gönderilir
     const broadcastContent = await resolveImageContent(finalContent);
 
     const pFrameData = {
@@ -673,7 +680,6 @@ app.post("/api/messages/send", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Kendi Mesajını Silme Endpoint'i
 app.post("/api/messages/delete", authenticate, async (req, res) => {
   const limit = checkRateLimit(`msgdel_${req.user.username}`, 3 * 1000, 10);
   if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
@@ -698,10 +704,9 @@ app.post("/api/messages/delete", authenticate, async (req, res) => {
       return res.status(403).json({ error: "Bu mesajı silme yetkiniz yok!" });
     }
 
-    // Eğer Silinen Mesaj Görsel Referansı İçeriyorsa IMGDB'den de Görseli Sil
     if (msg.content && msg.content.startsWith("img_ref:")) {
       const imgId = msg.content.replace("img_ref:", "");
-      await queryWorker("DELETE FROM images WHERE id = ?", [imgId], "IMGDB");
+      await queryWorker("DELETE FROM images WHERE id = ?", [imgId], "imgdb");
     }
 
     if (messageId) {
@@ -716,7 +721,6 @@ app.post("/api/messages/delete", authenticate, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Mesajları Getirirken Görsel Referanslarını Otomatik Çözümleme
 app.get("/api/messages/:groupToken", authenticate, async (req, res) => {
   const limit = checkRateLimit(`getmsg_${req.user.username}`, 60 * 1000, 60);
   if (limit.limited) return res.status(429).json({ error: "Çok fazla istek." });
@@ -737,7 +741,6 @@ app.get("/api/messages/:groupToken", authenticate, async (req, res) => {
 
     const rawMsgs = msgsRes.results || [];
     
-    // Asenkron olarak içerikteki img_ref değerlerini IMGDB'den doldur
     const resolvedMsgs = await Promise.all(
       rawMsgs.map(async (msg) => {
         const resolvedContent = await resolveImageContent(msg.content);
@@ -779,14 +782,47 @@ app.post("/api/admin/action", authenticate, async (req, res) => {
   res.json({ message: `Hesap talebi ${action} edildi.` });
 });
 
+// KAPSAMLI KULLANICI SİLME & KASKAD ÇÖP TOPLAMA
 app.post("/api/admin/delete-user", authenticate, async (req, res) => {
   if (req.user.role !== "admin") return res.status(403).json({ error: "Yasaklandı" });
   const { username } = req.body;
-  await queryWorker("DELETE FROM users WHERE username = ?", [username]);
-  await queryWorker("DELETE FROM group_members WHERE username = ?", [username]);
-  await queryWorker("DELETE FROM friends WHERE user1 = ? OR user2 = ?", [username, username]);
-  broadcastPFrame("USER_DELETED", { username });
-  res.json({ message: `${username} kullanıcısı silindi.` });
+
+  try {
+    // 1. Kullanıcının dahil olduğu tüm grupları tespit et
+    const userGroupsRes = await queryWorker("SELECT group_token FROM group_members WHERE username = ?", [username]);
+    const userGroups = (userGroupsRes.results || []).map(g => g.group_token);
+
+    // 2. Kullanıcının attığı görselleri imgdb'den temizle
+    const userMsgsRes = await queryWorker("SELECT content FROM messages WHERE sender = ?", [username]);
+    if (userMsgsRes.results) {
+      for (const m of userMsgsRes.results) {
+        if (m.content && m.content.startsWith("img_ref:")) {
+          const imgId = m.content.replace("img_ref:", "");
+          await queryWorker("DELETE FROM images WHERE id = ?", [imgId], "imgdb");
+        }
+      }
+    }
+
+    // 3. Kullanıcıya ait temel verileri temizle
+    await queryWorker("DELETE FROM users WHERE username = ?", [username]);
+    await queryWorker("DELETE FROM pending_accounts WHERE username = ?", [username]);
+    await queryWorker("DELETE FROM group_members WHERE username = ?", [username]);
+    await queryWorker("DELETE FROM friends WHERE user1 = ? OR user2 = ?", [username, username]);
+    await queryWorker("DELETE FROM messages WHERE sender = ?", [username]);
+
+    // 4. Kullanıcının ayrılması sonucu tamamen boş kalan grupları sil
+    for (const gToken of userGroups) {
+      const remaining = await queryWorker("SELECT username FROM group_members WHERE group_token = ?", [gToken]);
+      if (!remaining.results || remaining.results.length === 0) {
+        await purgeGroupCompletely(gToken);
+      }
+    }
+
+    broadcastPFrame("USER_DELETED", { username });
+    res.json({ message: `${username} kullanıcısı ve tüm bağımlı verileri tamamen silindi.` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
