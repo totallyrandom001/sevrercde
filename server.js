@@ -1,772 +1,618 @@
+// ============================================================================
+// SOPERT SERVER — optimized for minimum DB reads, server-side auth everywhere
+// ============================================================================
+//
+// Key design decisions (read this before touching anything):
+//
+// 1. NOTHING is ever "refetch everything" on write. Every mutation handler
+//    already has the row(s) it just changed in memory — those exact rows are
+//    what gets broadcast over SSE. Clients patch their cache with the payload
+//    instead of re-querying. This is what kills the read-row explosion.
+//
+// 2. Messages are paginated (default 50, cursor = message id) both on first
+//    load and on scroll-back ("before" param). No endpoint ever returns an
+//    entire thread in one shot.
+//
+// 3. Every route that touches a group, a message, or another user's data
+//    re-derives permission from the DB itself (membership, ownership,
+//    can_add_members, admin role) — the client's UI state is never trusted.
+//
+// 4. Tokens: session tokens are opaque random strings stored in a `sessions`
+//    table (not JWT — so they can be revoked instantly), hashed passwords
+//    (scrypt), and a separate short-lived (60s) single-purpose stream token
+//    for SSE, since EventSource can't send an Authorization header and long-
+//    lived tokens should never sit in a URL / server access log.
+//
+// ============================================================================
+
 const express = require("express");
-const cors = require("cors");
-const fetch = require("node-fetch");
-
-const app = express();
-
-app.use(express.json({ limit: "10mb" }));
-app.use(cors({
-  origin: "*",
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
-}));
-
-app.options("*", cors());
-
-const CF_WORKER_URL = "https://winter-king-b73e.totallyrandom000148932804.workers.dev";
-const WORKER_SECRET = process.env.WORKER_SECRET;
-
-const rateLimitMap = new Map();
-
-function checkRateLimit(key, windowMs, maxHits) {
-  const now = Date.now();
-  if (!rateLimitMap.has(key)) {
-    rateLimitMap.set(key, []);
-  }
-
-  const timestamps = rateLimitMap.get(key).filter(ts => now - ts < windowMs);
-
-  if (timestamps.length >= maxHits) {
-    const oldestTimestamp = timestamps[0];
-    const retryAfterMs = windowMs - (now - oldestTimestamp);
-    return { limited: true, retryAfterSec: Math.ceil(retryAfterMs / 1000) };
-  }
-
-  timestamps.push(now);
-  rateLimitMap.set(key, timestamps);
-  return { limited: false };
-}
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, timestamps] of rateLimitMap.entries()) {
-    const valid = timestamps.filter(ts => now - ts < 15 * 60 * 1000);
-    if (valid.length === 0) rateLimitMap.delete(key);
-    else rateLimitMap.set(key, valid);
-  }
-}, 10 * 60 * 1000);
-
-async function cleanupOldImageRecords() {
-  try {
-    const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
-    await queryWorker("DELETE FROM images WHERE created_at < ?", [twentyFourHoursAgo], "imgdb");
-    await queryWorker("DELETE FROM messages WHERE content LIKE 'img_ref:%' AND created_at < ?", [twentyFourHoursAgo], "DB");
-  } catch (err) {
-    console.error("Zaman bazlı görsel temizliği hatası:", err.message);
-  }
-}
-
-setInterval(cleanupOldImageRecords, 60 * 60 * 1000);
-
-function generateToken(username, password) {
-  const cleanUser = username.toLowerCase().replace(/[^a-z]/g, "");
-  let token = "";
-  const maxLen = Math.max(cleanUser.length, password.length);
-  for (let i = 0; i < maxLen; i++) {
-    if (i < cleanUser.length) token += cleanUser[i];
-    if (i < password.length) token += password[i];
-  }
-  return token;
-}
-
-async function queryWorker(sql, params = [], targetDb = "DB") {
-  if (!WORKER_SECRET) throw new Error("WORKER_SECRET environment variable is missing!");
-  const res = await fetch(`${CF_WORKER_URL}/query`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Worker-Secret": WORKER_SECRET
-    },
-    body: JSON.stringify({ sql, params, targetDb })
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Worker Error: ${text}`);
-  }
-  return await res.json();
-}
-
-async function authenticate(req, res, next) {
-  const token = req.headers.authorization || req.query.token;
-  if (!token) return res.status(401).json({ error: "Missing authentication token" });
-
-  try {
-    const userRes = await queryWorker("SELECT * FROM users WHERE token = ?", [token]);
-    if (!userRes.results || userRes.results.length === 0) {
-      return res.status(401).json({ error: "Invalid token session" });
-    }
-    req.user = userRes.results[0];
-    next();
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-}
-
-async function getGroupMemberUsernames(groupToken) {
-  try {
-    const res = await queryWorker(
-      "SELECT DISTINCT username FROM group_members WHERE group_token = ? UNION SELECT username FROM users WHERE role = 'admin'",
-      [groupToken]
-    );
-    return (res.results || []).map(r => r.username);
-  } catch (err) {
-    console.error("Grup üyeleri getirilirken hata:", err);
-    return [];
-  }
-}
-
-async function resolveImageContent(content) {
-  if (content && content.startsWith("img_ref:")) {
-    const imageId = content.replace("img_ref:", "");
-    const imgRes = await queryWorker("SELECT base64_data FROM images WHERE id = ?", [imageId], "imgdb");
-    if (imgRes.results && imgRes.results.length > 0) {
-      return imgRes.results[0].base64_data;
-    }
-    return "[Görsel Silindi veya Bulunamadı]";
-  }
-  return content;
-}
-
-let sseClients = [];
-function broadcastPFrame(eventType, payload, targetUsernames = null) {
-  const dataString = `data: ${JSON.stringify({ frameType: "P-FRAME", type: eventType, payload })}\n\n`;
-  sseClients.forEach(client => {
-    if (!targetUsernames || targetUsernames.includes(client.username)) {
-      client.res.write(dataString);
-    }
-  });
-}
-
-async function fetchUserSnapshot(user) {
-  const groupsRes = user.role === "admin"
-    ? await queryWorker("SELECT * FROM groups")
-    : await queryWorker("SELECT g.* FROM groups g JOIN group_members gm ON g.group_token = gm.group_token WHERE gm.username = ?", [user.username]);
-  const groups = groupsRes.results || [];
-
-  const friendsRes = await queryWorker("SELECT * FROM friends WHERE user1 = ? OR user2 = ?", [user.username, user.username]);
-  const friendRows = friendsRes.results || [];
-
-  const usersRes = await queryWorker("SELECT username, pfp FROM users");
-  const userMap = {};
-  (usersRes.results || []).forEach(u => userMap[u.username] = u.pfp || "");
-
-  const friends = friendRows.map(f => {
-    const otherUser = f.user1 === user.username ? f.user2 : f.user1;
-    return {
-      id: f.id,
-      user1: f.user1,
-      user2: f.user2,
-      status: f.status,
-      pfp: userMap[otherUser] || ""
-    };
-  });
-
-  return { groups, friends };
-}
-
-app.get("/", (req, res) => res.send("SOPERT Backend Online"));
-
-app.get("/api/snapshot", authenticate, async (req, res) => {
-  try {
-    const snapshot = await fetchUserSnapshot(req.user);
-    res.json(snapshot);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.get("/api/stream", authenticate, async (req, res) => {
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-
-  const client = { username: req.user.username, res };
-  sseClients.push(client);
-
-  try {
-    const snapshot = await fetchUserSnapshot(req.user);
-    res.write(`data: ${JSON.stringify({
-      frameType: "I-FRAME",
-      user: { username: req.user.username, role: req.user.role, pfp: req.user.pfp || "" },
-      ...snapshot
-    })}\n\n`);
-  } catch (err) {
-    console.error("Stream Error:", err);
-  }
-
-  req.on("close", () => {
-    sseClients = sseClients.filter(c => c.res !== res);
-  });
-});
-
-app.get("/api/public/account-requests", async (req, res) => {
-  const ip = req.headers["x-forwarded-for"] || req.ip || "unknown";
-  const limit = checkRateLimit(`pub_req_${ip}`, 60 * 1000, 15);
-  if (limit.limited) {
-    return res.status(429).json({ error: `Çok fazla istek. Lütfen ${limit.retryAfterSec}s bekleyin.` });
-  }
-
-  try {
-    const pendingRes = await queryWorker("SELECT username FROM pending_accounts");
-    const acceptedRes = await queryWorker("SELECT username FROM users WHERE username NOT IN (SELECT DISTINCT sender FROM messages)");
-
-    res.json({
-      pending: (pendingRes.results || []).map(r => r.username),
-      accepted: (acceptedRes.results || []).map(r => r.username)
-    });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/register", async (req, res) => {
-  const ip = req.headers["x-forwarded-for"] || req.ip || "unknown";
-  const limit = checkRateLimit(`reg_${ip}`, 15 * 60 * 1000, 3);
-  if (limit.limited) {
-    return res.status(429).json({ error: `Çok fazla kayıt isteği. Lütfen ${limit.retryAfterSec}s bekleyin.` });
-  }
-
-  let { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error: "Gerekli alanlar eksik" });
-  username = username.toLowerCase().replace(/[^a-z]/g, "");
-
-  if (!username) return res.status(400).json({ error: "Kullanıcı adı geçerli harfler içermelidir" });
-
-  try {
-    const existingUser = await queryWorker("SELECT username FROM users WHERE username = ?", [username]);
-    if (existingUser.results && existingUser.results.length > 0) {
-      return res.status(409).json({ error: "Bu kullanıcı adına sahip bir hesap zaten var" });
-    }
-
-    const existingPending = await queryWorker("SELECT username FROM pending_accounts WHERE username = ?", [username]);
-    if (existingPending.results && existingPending.results.length > 0) {
-      return res.status(409).json({ error: "Bu kullanıcı adı için hesap oluşturma talebi zaten bekliyor" });
-    }
-
-    const countRes = await queryWorker("SELECT COUNT(*) as count FROM pending_accounts");
-    if (countRes.results[0].count >= 5) {
-      return res.status(429).json({ error: "Maksimum 5 bekleyen isteğe izin verilir" });
-    }
-
-    const token = generateToken(username, password);
-    await queryWorker("INSERT INTO pending_accounts (username, password, token) VALUES (?, ?, ?)", [username, password, token]);
-    res.json({ message: "Hesap oluşturma talebi onay için yöneticiye gönderildi" });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/login", async (req, res) => {
-  const ip = req.headers["x-forwarded-for"] || req.ip || "unknown";
-  const limit = checkRateLimit(`login_${ip}`, 60 * 1000, 5);
-  if (limit.limited) {
-    return res.status(429).json({ error: `Çok fazla giriş denemesi. Lütfen ${limit.retryAfterSec}s bekleyin.` });
-  }
-
-  let { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error: "Kullanıcı adı ve şifre girin" });
-  username = username.toLowerCase().replace(/[^a-z]/g, "");
-  const token = generateToken(username, password);
-
-  try {
-    const userRes = await queryWorker("SELECT * FROM users WHERE username = ? AND token = ?", [username, token]);
-    if (!userRes.results || userRes.results.length === 0) return res.status(401).json({ error: "Geçersiz kimlik bilgileri veya bekleyen onay" });
-    res.json({ token, username: userRes.results[0].username, role: userRes.results[0].role, pfp: userRes.results[0].pfp || "" });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/user/pfp", authenticate, async (req, res) => {
-  const limit = checkRateLimit(`pfp_${req.user.username}`, 10 * 60 * 1000, 1);
-  if (limit.limited) {
-    const mins = Math.ceil(limit.retryAfterSec / 60);
-    return res.status(429).json({ error: `Profil resmi 10 dakikada bir güncellenebilir. ${mins} dakika sonra tekrar deneyin.` });
-  }
-
-  const { pfpBase64 } = req.body;
-  if (!pfpBase64) return res.status(400).json({ error: "Görsel sağlanmadı" });
-
-  const byteSize = Buffer.byteLength(pfpBase64, "utf8");
-  if (byteSize > 512 * 1024) {
-    return res.status(413).json({ error: "Görsel 512KB sunucu sınırını aşıyor" });
-  }
-
-  try {
-    await queryWorker("UPDATE users SET pfp = ? WHERE username = ?", [pfpBase64, req.user.username]);
-    broadcastPFrame("PFP_UPDATED", { username: req.user.username, pfp: pfpBase64 });
-    res.json({ message: "Profil resmi başarıyla güncellendi" });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/friends/request", authenticate, async (req, res) => {
-  const limit = checkRateLimit(`freq_${req.user.username}`, 60 * 1000, 5);
-  if (limit.limited) {
-    return res.status(429).json({ error: `Çok hızlı istek gönderiyorsunuz. Lütfen ${limit.retryAfterSec}s bekleyin.` });
-  }
-
-  let { targetUsername } = req.body;
-  if (!targetUsername) return res.status(400).json({ error: "Hedef kullanıcı adı gerekli" });
-  targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
-
-  if (targetUsername === req.user.username) return res.status(400).json({ error: "Kendinizi ekleyemezsiniz" });
-
-  try {
-    const checkUser = await queryWorker("SELECT username FROM users WHERE username = ?", [targetUsername]);
-    if (!checkUser.results || !checkUser.results.length) return res.status(404).json({ error: "Kullanıcı bulunamadı" });
-
-    const checkExisting = await queryWorker(
-      "SELECT * FROM friends WHERE (user1 = ? AND user2 = ?) OR (user1 = ? AND user2 = ?)",
-      [req.user.username, targetUsername, targetUsername, req.user.username]
-    );
-
-    if (checkExisting.results && checkExisting.results.length > 0) {
-      const rel = checkExisting.results[0];
-      if (rel.status === "accepted") return res.status(409).json({ error: "Bu kullanıcı ile zaten arkadaşsınız" });
-      return res.status(409).json({ error: "Arkadaşlık isteği zaten beklemede" });
-    }
-
-    await queryWorker("INSERT INTO friends (user1, user2, status) VALUES (?, ?, 'pending')", [req.user.username, targetUsername]);
-    broadcastPFrame("FRIEND_REQUEST_SENT", { from: req.user.username, to: targetUsername }, [targetUsername, req.user.username]);
-    res.json({ message: "İstek başarıyla gönderildi" });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/friends/accept", authenticate, async (req, res) => {
-  const limit = checkRateLimit(`faccept_${req.user.username}`, 60 * 1000, 10);
-  if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
-
-  let { targetUsername } = req.body;
-  targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
-
-  try {
-    await queryWorker("UPDATE friends SET status = 'accepted' WHERE user1 = ? AND user2 = ?", [targetUsername, req.user.username]);
-    broadcastPFrame("FRIEND_ACCEPTED", { user1: targetUsername, user2: req.user.username }, [req.user.username, targetUsername]);
-    res.json({ message: "Arkadaşlık isteği kabul edildi" });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/friends/unfriend", authenticate, async (req, res) => {
-  const limit = checkRateLimit(`funfriend_${req.user.username}`, 60 * 1000, 10);
-  if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
-
-  let { targetUsername } = req.body;
-  targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
-
-  try {
-    await queryWorker(
-      "DELETE FROM friends WHERE (user1 = ? AND user2 = ?) OR (user1 = ? AND user2 = ?)",
-      [req.user.username, targetUsername, targetUsername, req.user.username]
-    );
-    broadcastPFrame("FRIEND_REMOVED", { user1: req.user.username, user2: targetUsername }, [req.user.username, targetUsername]);
-    res.json({ message: `@${targetUsername} arkadaşlıktan çıkarıldı` });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.get("/api/groups/:groupToken/members", authenticate, async (req, res) => {
-  const limit = checkRateLimit(`gmembers_${req.user.username}`, 60 * 1000, 30);
-  if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
-
-  try {
-    const groupRes = await queryWorker("SELECT created_by, allow_sub_invites FROM groups WHERE group_token = ?", [req.params.groupToken]);
-    if (!groupRes.results || groupRes.results.length === 0) {
-      return res.status(404).json({ error: "Grup bulunamadı" });
-    }
-    const groupInfo = groupRes.results[0];
-
-    if (req.user.role !== "admin") {
-      const isMember = await queryWorker("SELECT * FROM group_members WHERE group_token = ? AND username = ?", [req.params.groupToken, req.user.username]);
-      if (!isMember.results || isMember.results.length === 0) {
-        return res.status(403).json({ error: "Erişim reddedildi" });
-      }
-    }
-
-    const members = await queryWorker(
-      "SELECT gm.username, gm.can_add_members, gm.invited_by, u.pfp FROM group_members gm LEFT JOIN users u ON gm.username = u.username WHERE gm.group_token = ?",
-      [req.params.groupToken]
-    );
-
-    res.json({
-      groupInfo,
-      members: members.results || []
-    });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/groups/create", authenticate, async (req, res) => {
-  const limit = checkRateLimit(`grp_${req.user.username}`, 5 * 60 * 1000, 2);
-  if (limit.limited) {
-    return res.status(429).json({ error: `5 dakikada yalnızca 2 grup oluşturabilirsiniz. Lütfen ${limit.retryAfterSec}s bekleyin.` });
-  }
-
-  const { groupName } = req.body;
-  if (!groupName || !groupName.trim()) return res.status(400).json({ error: "Grup adı gereklidir" });
-  const groupToken = "grp_" + Math.random().toString(36).substring(2, 10);
-
-  try {
-    await queryWorker("INSERT INTO groups (group_token, group_name, created_by, allow_sub_invites) VALUES (?, ?, ?, 1)", [groupToken, groupName.trim(), req.user.username]);
-    await queryWorker("INSERT INTO group_members (group_token, username, custom_member_token, can_add_members, invited_by) VALUES (?, ?, ?, 1, ?)", [groupToken, req.user.username, req.user.token, req.user.username]);
-    
-    const targetUsers = await getGroupMemberUsernames(groupToken);
-    broadcastPFrame("GROUP_CREATED", { group_token: groupToken, group_name: groupName, created_by: req.user.username }, targetUsers);
-    res.json({ message: "Grup başarıyla oluşturuldu", groupToken });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/groups/add-member", authenticate, async (req, res) => {
-  const limit = checkRateLimit(`gadd_${req.user.username}`, 60 * 1000, 10);
-  if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
-
-  let { groupToken, targetUsername } = req.body;
-  if (!groupToken || !targetUsername) return res.status(400).json({ error: "Grup jetonu ve hedef kullanıcı gerekli" });
-  targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
-
-  try {
-    const groupRes = await queryWorker("SELECT * FROM groups WHERE group_token = ?", [groupToken]);
-    if (!groupRes.results || groupRes.results.length === 0) return res.status(404).json({ error: "Grup bulunamadı" });
-    const group = groupRes.results[0];
-
-    if (req.user.role !== "admin") {
-      const isMemberRes = await queryWorker("SELECT * FROM group_members WHERE group_token = ? AND username = ?", [groupToken, req.user.username]);
-      if (!isMemberRes.results || isMemberRes.results.length === 0) {
-        return res.status(403).json({ error: "Bu grubun üyesi değilsiniz" });
-      }
-      const requesterMember = isMemberRes.results[0];
-
-      const isOwner = group.created_by === req.user.username;
-      if (!isOwner) {
-        if (requesterMember.can_add_members === 0) {
-          return res.status(403).json({ error: "Gruba üye ekleme yetkiniz kapatılmış" });
-        }
-
-        const allowSubInvites = group.allow_sub_invites !== 0;
-        if (!allowSubInvites) {
-          const wasInvitedByOwner = requesterMember.invited_by === group.created_by || requesterMember.username === group.created_by;
-          if (!wasInvitedByOwner) {
-            return res.status(403).json({ error: "Bu grupta yalnızca kurucu tarafından eklenen üyeler başkalarını davet edebilir" });
-          }
-        }
-      }
-
-      const isFriend = await queryWorker(
-        "SELECT * FROM friends WHERE ((user1 = ? AND user2 = ?) OR (user1 = ? AND user2 = ?)) AND status = 'accepted'",
-        [req.user.username, targetUsername, targetUsername, req.user.username]
-      );
-
-      if (!isFriend.results || isFriend.results.length === 0) {
-        return res.status(403).json({ error: `@${targetUsername} kişisini gruba eklemek için kabul edilmiş arkadaş olmalısınız` });
-      }
-    }
-
-    await queryWorker("INSERT OR REPLACE INTO group_members (group_token, username, custom_member_token, can_add_members, invited_by) VALUES (?, ?, 'DEFAULT', 1, ?)", [groupToken, targetUsername, req.user.username]);
-    
-    const targetUsers = await getGroupMemberUsernames(groupToken);
-    broadcastPFrame("GROUP_MEMBER_ADDED", { groupToken, targetUsername }, targetUsers);
-    res.json({ message: `@${targetUsername} gruba eklendi` });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/groups/remove-member", authenticate, async (req, res) => {
-  const limit = checkRateLimit(`grem_${req.user.username}`, 60 * 1000, 10);
-  if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
-
-  let { groupToken, targetUsername } = req.body;
-  if (!groupToken || !targetUsername) return res.status(400).json({ error: "Eksik parametreler" });
-  targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
-
-  try {
-    const groupRes = await queryWorker("SELECT * FROM groups WHERE group_token = ?", [groupToken]);
-    if (!groupRes.results || groupRes.results.length === 0) return res.status(404).json({ error: "Grup bulunamadı" });
-    const group = groupRes.results[0];
-
-    const isOwner = group.created_by === req.user.username;
-    if (!isOwner && req.user.role !== "admin") {
-      return res.status(403).json({ error: "Yalnızca grup kurucusu üyeleri gruptan çıkarabilir" });
-    }
-
-    if (targetUsername === group.created_by) {
-      return res.status(400).json({ error: "Grup kurucusu gruptan çıkarılamaz" });
-    }
-
-    const targetUsers = await getGroupMemberUsernames(groupToken);
-    await queryWorker("DELETE FROM group_members WHERE group_token = ? AND username = ?", [groupToken, targetUsername]);
-    
-    const remainingMembers = await queryWorker("SELECT username FROM group_members WHERE group_token = ?", [groupToken]);
-    if (!remainingMembers.results || remainingMembers.results.length === 0) {
-      await queryWorker("DELETE FROM groups WHERE group_token = ?", [groupToken]);
-      await queryWorker("DELETE FROM messages WHERE group_token = ?", [groupToken]);
-    }
-
-    broadcastPFrame("GROUP_MEMBER_LEFT", { groupToken, username: targetUsername }, targetUsers);
-    res.json({ message: `@${targetUsername} gruptan çıkarıldı` });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/groups/toggle-member-invite-perm", authenticate, async (req, res) => {
-  const limit = checkRateLimit(`gtoggle_${req.user.username}`, 60 * 1000, 20);
-  if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
-
-  let { groupToken, targetUsername, canAddMembers } = req.body;
-  if (!groupToken || !targetUsername) return res.status(400).json({ error: "Eksik parametreler" });
-
-  try {
-    const groupRes = await queryWorker("SELECT * FROM groups WHERE group_token = ?", [groupToken]);
-    if (!groupRes.results || groupRes.results.length === 0) return res.status(404).json({ error: "Grup bulunamadı" });
-    const group = groupRes.results[0];
-
-    if (group.created_by !== req.user.username && req.user.role !== "admin") {
-      return res.status(403).json({ error: "Yalnızca grup kurucusu izinleri değiştirebilir" });
-    }
-
-    const newPerm = canAddMembers ? 1 : 0;
-    await queryWorker("UPDATE group_members SET can_add_members = ? WHERE group_token = ? AND username = ?", [newPerm, groupToken, targetUsername]);
-
-    const targetUsers = await getGroupMemberUsernames(groupToken);
-    broadcastPFrame("GROUP_PERM_UPDATED", { groupToken, targetUsername, canAddMembers: newPerm }, targetUsers);
-    res.json({ message: "Üye izni güncellendi" });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/groups/toggle-sub-invites", authenticate, async (req, res) => {
-  const limit = checkRateLimit(`gsub_${req.user.username}`, 60 * 1000, 10);
-  if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
-
-  let { groupToken, allowSubInvites } = req.body;
-  if (!groupToken) return res.status(400).json({ error: "Grup jetonu gerekli" });
-
-  try {
-    const groupRes = await queryWorker("SELECT * FROM groups WHERE group_token = ?", [groupToken]);
-    if (!groupRes.results || groupRes.results.length === 0) return res.status(404).json({ error: "Grup bulunamadı" });
-    const group = groupRes.results[0];
-
-    if (group.created_by !== req.user.username && req.user.role !== "admin") {
-      return res.status(403).json({ error: "Yalnızca grup kurucusu bu ayarı değiştirebilir" });
-    }
-
-    const newVal = allowSubInvites ? 1 : 0;
-    await queryWorker("UPDATE groups SET allow_sub_invites = ? WHERE group_token = ?", [newVal, groupToken]);
-
-    const targetUsers = await getGroupMemberUsernames(groupToken);
-    broadcastPFrame("GROUP_SETTING_UPDATED", { groupToken, allowSubInvites: newVal }, targetUsers);
-    res.json({ message: "Grup davet ilkesi güncellendi" });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/groups/leave", authenticate, async (req, res) => {
-  const limit = checkRateLimit(`gleave_${req.user.username}`, 60 * 1000, 5);
-  if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
-
-  const { groupToken } = req.body;
-  if (!groupToken) return res.status(400).json({ error: "Grup jetonu gerekli" });
-
-  try {
-    const targetUsers = await getGroupMemberUsernames(groupToken);
-    await queryWorker("DELETE FROM group_members WHERE group_token = ? AND username = ?", [groupToken, req.user.username]);
-
-    const remainingMembers = await queryWorker("SELECT username FROM group_members WHERE group_token = ?", [groupToken]);
-    const groupRes = await queryWorker("SELECT created_by FROM groups WHERE group_token = ?", [groupToken]);
-
-    if (!remainingMembers.results || remainingMembers.results.length === 0) {
-      await queryWorker("DELETE FROM groups WHERE group_token = ?", [groupToken]);
-      await queryWorker("DELETE FROM messages WHERE group_token = ?", [groupToken]);
-    } else if (groupRes.results && groupRes.results.length > 0) {
-      const group = groupRes.results[0];
-      if (group.created_by === req.user.username) {
-        const nextOwner = remainingMembers.results[0].username;
-        await queryWorker("UPDATE groups SET created_by = ? WHERE group_token = ?", [nextOwner, groupToken]);
-      }
-    }
-
-    broadcastPFrame("GROUP_MEMBER_LEFT", { groupToken, username: req.user.username }, targetUsers);
-    res.json({ message: "Gruptan başarıyla ayrılındı" });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/dm/open", authenticate, async (req, res) => {
-  const limit = checkRateLimit(`dm_${req.user.username}`, 60 * 1000, 10);
-  if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
-
-  let { targetUsername } = req.body;
-  targetUsername = targetUsername.toLowerCase().replace(/[^a-z]/g, "");
-
-  try {
-    const friendCheck = await queryWorker(
-      "SELECT * FROM friends WHERE ((user1 = ? AND user2 = ?) OR (user1 = ? AND user2 = ?)) AND status = 'accepted'",
-      [req.user.username, targetUsername, targetUsername, req.user.username]
-    );
-
-    if (!friendCheck.results.length && req.user.role !== "admin") {
-      return res.status(403).json({ error: "Direkt mesaj başlatmak için kabul edilmiş arkadaş olmalısınız" });
-    }
-
-    const dmGroupToken = "dm_" + [req.user.username, targetUsername].sort().join("_");
-    await queryWorker("INSERT OR IGNORE INTO groups (group_token, group_name, created_by, allow_sub_invites) VALUES (?, ?, ?, 1)", [dmGroupToken, `@${targetUsername}`, req.user.username]);
-    await queryWorker("INSERT OR IGNORE INTO group_members (group_token, username, custom_member_token, can_add_members) VALUES (?, ?, 'DM', 1)", [dmGroupToken, req.user.username]);
-    await queryWorker("INSERT OR IGNORE INTO group_members (group_token, username, custom_member_token, can_add_members) VALUES (?, ?, 'DM', 1)", [dmGroupToken, targetUsername]);
-
-    res.json({ groupToken: dmGroupToken });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Mesaj Gönderme (Strict 1MB Sunucu Kontrolü ve imgdb Ayrıştırma)
-app.post("/api/messages/send", authenticate, async (req, res) => {
-  const limit = checkRateLimit(`msg_${req.user.username}`, 3 * 1000, 5);
-  if (limit.limited) {
-    return res.status(429).json({ error: "Çok hızlı mesaj gönderiyorsunuz. Lütfen yavaşlayın." });
-  }
-
-  let { groupToken, content, replyToSender, replyToContent } = req.body;
-  if (!groupToken || !content) return res.status(400).json({ error: "Mesaj içeriği eksik" });
-  const timestamp = Date.now();
-
-  try {
-    if (req.user.role !== "admin") {
-      const isMember = await queryWorker("SELECT * FROM group_members WHERE group_token = ? AND username = ?", [groupToken, req.user.username]);
-      if (!isMember.results || isMember.results.length === 0) {
-        return res.status(403).json({ error: "Mesaj göndermek için bu grubun üyesi olmalısınız" });
-      }
-    }
-
-    let finalContent = content;
-
-    // SUNUCU KONTROLÜ: 1MB = 1024 * 1024 Bayt
-    if (content.startsWith("data:image/")) {
-      const byteSize = Buffer.byteLength(content, "utf8");
-      const MAX_BYTES = 1024 * 1024; // Tam 1MB
-      if (byteSize > MAX_BYTES) {
-        return res.status(413).json({ error: "Görsel boyutu 1MB sınırını aşıyor!" });
-      }
-
-      const imgId = "img_" + Math.random().toString(36).substring(2, 12) + "_" + timestamp;
-      await queryWorker("INSERT INTO images (id, base64_data, created_at) VALUES (?, ?, ?)", [imgId, content, timestamp], "imgdb");
-      finalContent = `img_ref:${imgId}`;
-    }
-
-    await queryWorker(
-      "INSERT INTO messages (group_token, sender, content, created_at, reply_to_sender, reply_to_content) VALUES (?, ?, ?, ?, ?, ?)",
-      [groupToken, req.user.username, finalContent, timestamp, replyToSender || null, replyToContent || null],
-      "DB"
-    );
-
-    const broadcastContent = await resolveImageContent(finalContent);
-
-    const pFrameData = {
-      group_token: groupToken,
-      sender: req.user.username,
-      content: broadcastContent,
-      created_at: timestamp,
-      reply_to_sender: replyToSender || null,
-      reply_to_content: replyToContent || null,
-      pfp: req.user.pfp || ""
-    };
-
-    const targetUsers = await getGroupMemberUsernames(groupToken);
-    broadcastPFrame("NEW_MESSAGE", pFrameData, targetUsers);
-    res.json({ message: "Mesaj gönderildi" });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/messages/delete", authenticate, async (req, res) => {
-  const limit = checkRateLimit(`msgdel_${req.user.username}`, 3 * 1000, 10);
-  if (limit.limited) return res.status(429).json({ error: "İşlem sınırı aşıldı." });
-
-  const { messageId, groupToken, createdAt } = req.body;
-
-  try {
-    let msgRes;
-    if (messageId) {
-      msgRes = await queryWorker("SELECT * FROM messages WHERE id = ?", [messageId], "DB");
-    } else {
-      msgRes = await queryWorker("SELECT * FROM messages WHERE group_token = ? AND sender = ? AND created_at = ?", [groupToken, req.user.username, createdAt], "DB");
-    }
-
-    if (!msgRes.results || msgRes.results.length === 0) {
-      return res.status(404).json({ error: "Silinecek mesaj bulunamadı" });
-    }
-
-    const msg = msgRes.results[0];
-
-    if (msg.sender !== req.user.username && req.user.role !== "admin") {
-      return res.status(403).json({ error: "Bu mesajı silme yetkiniz yok!" });
-    }
-
-    if (msg.content && msg.content.startsWith("img_ref:")) {
-      const imgId = msg.content.replace("img_ref:", "");
-      await queryWorker("DELETE FROM images WHERE id = ?", [imgId], "imgdb");
-    }
-
-    if (messageId) {
-      await queryWorker("DELETE FROM messages WHERE id = ?", [messageId], "DB");
-    } else {
-      await queryWorker("DELETE FROM messages WHERE group_token = ? AND sender = ? AND created_at = ?", [groupToken, req.user.username, createdAt], "DB");
-    }
-
-    const targetUsers = await getGroupMemberUsernames(msg.group_token);
-    broadcastPFrame("MESSAGE_DELETED", { groupToken: msg.group_token, messageId: msg.id, createdAt: msg.created_at }, targetUsers);
-    res.json({ message: "Mesaj başarıyla silindi" });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.get("/api/messages/:groupToken", authenticate, async (req, res) => {
-  const limit = checkRateLimit(`getmsg_${req.user.username}`, 60 * 1000, 60);
-  if (limit.limited) return res.status(429).json({ error: "Çok fazla istek." });
-
-  try {
-    if (req.user.role !== "admin") {
-      const isMember = await queryWorker("SELECT * FROM group_members WHERE group_token = ? AND username = ?", [req.params.groupToken, req.user.username]);
-      if (!isMember.results || isMember.results.length === 0) {
-        return res.status(403).json({ error: "Grup mesajlarına erişim reddedildi" });
-      }
-    }
-
-    const msgsRes = await queryWorker(
-      "SELECT m.*, u.pfp FROM messages m LEFT JOIN users u ON m.sender = u.username WHERE m.group_token = ? ORDER BY m.created_at ASC",
-      [req.params.groupToken],
-      "DB"
-    );
-
-    const rawMsgs = msgsRes.results || [];
-    const resolvedMsgs = await Promise.all(
-      rawMsgs.map(async (msg) => {
-        const resolvedContent = await resolveImageContent(msg.content);
-        return { ...msg, content: resolvedContent };
-      })
-    );
-
-    res.json(resolvedMsgs);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.get("/api/admin/pending", authenticate, async (req, res) => {
-  if (req.user.role !== "admin") return res.status(403).json({ error: "Yasaklandı" });
-  const data = await queryWorker("SELECT * FROM pending_accounts");
-  res.json(data.results || []);
-});
-
-app.get("/api/admin/users", authenticate, async (req, res) => {
-  if (req.user.role !== "admin") return res.status(403).json({ error: "Yasaklandı" });
-  try {
-    const data = await queryWorker("SELECT username, role FROM users");
-    res.json(data.results || []);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/admin/action", authenticate, async (req, res) => {
-  if (req.user.role !== "admin") return res.status(403).json({ error: "Yasaklandı" });
-  const { id, action } = req.body;
-  const reqRes = await queryWorker("SELECT * FROM pending_accounts WHERE id = ?", [id]);
-  if (!reqRes.results.length) return res.status(404).json({ error: "Bulunamadı" });
-
-  const item = reqRes.results[0];
-  if (action === "approve") {
-    await queryWorker("INSERT INTO users (username, token) VALUES (?, ?)", [item.username, item.token]);
-  }
-  await queryWorker("DELETE FROM pending_accounts WHERE id = ?", [id]);
-  broadcastPFrame("ADMIN_ACTION", { id, action });
-  res.json({ message: `Hesap talebi ${action} edildi.` });
-});
-
-app.post("/api/admin/delete-user", authenticate, async (req, res) => {
-  if (req.user.role !== "admin") return res.status(403).json({ error: "Yasaklandı" });
-  const { username } = req.body;
-  await queryWorker("DELETE FROM users WHERE username = ?", [username]);
-  await queryWorker("DELETE FROM group_members WHERE username = ?", [username]);
-  await queryWorker("DELETE FROM friends WHERE user1 = ? OR user2 = ?", [username, username]);
-  broadcastPFrame("USER_DELETED", { username });
-  res.json({ message: `${username} kullanıcısı silindi.` });
-});
+const Database = require("better-sqlite3");
+const crypto = require("crypto");
+const path = require("path");
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`SOPERT Sunucusu ${PORT} portunda çevrimiçi`));
+const app = express();
+app.use(express.json({ limit: "2mb" })); // images are base64, capped client-side at 1MB -> ~1.4MB b64
+
+const db = new Database(path.join(__dirname, "sopert.db"));
+db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
+
+// ---------------------------------------------------------------------------
+// Schema
+// ---------------------------------------------------------------------------
+db.exec(`
+CREATE TABLE IF NOT EXISTS users (
+  username        TEXT PRIMARY KEY,
+  password_hash   TEXT NOT NULL,
+  password_salt   TEXT NOT NULL,
+  role            TEXT NOT NULL DEFAULT 'user',   -- 'user' | 'admin'
+  status          TEXT NOT NULL DEFAULT 'pending', -- 'pending' | 'approved'
+  pfp             TEXT,
+  created_at      INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  token           TEXT PRIMARY KEY,
+  username        TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+  created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_username ON sessions(username);
+
+CREATE TABLE IF NOT EXISTS stream_tokens (
+  token           TEXT PRIMARY KEY,
+  username        TEXT NOT NULL,
+  expires_at      INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS friends (
+  user1           TEXT NOT NULL,
+  user2           TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'pending', -- 'pending' | 'accepted'
+  created_at      INTEGER NOT NULL,
+  PRIMARY KEY (user1, user2)
+);
+
+CREATE TABLE IF NOT EXISTS groups_t (
+  group_token         TEXT PRIMARY KEY,
+  group_name          TEXT NOT NULL,
+  created_by          TEXT NOT NULL,
+  allow_sub_invites   INTEGER NOT NULL DEFAULT 1,
+  created_at          INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS group_members (
+  group_token       TEXT NOT NULL REFERENCES groups_t(group_token) ON DELETE CASCADE,
+  username          TEXT NOT NULL,
+  can_add_members   INTEGER NOT NULL DEFAULT 1,
+  joined_at         INTEGER NOT NULL,
+  PRIMARY KEY (group_token, username)
+);
+CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(username);
+
+CREATE TABLE IF NOT EXISTS messages (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_token         TEXT NOT NULL REFERENCES groups_t(group_token) ON DELETE CASCADE,
+  sender              TEXT NOT NULL,
+  content             TEXT NOT NULL,
+  reply_to_sender     TEXT,
+  reply_to_content    TEXT,
+  created_at          INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_group_id ON messages(group_token, id);
+`);
+
+// ---------------------------------------------------------------------------
+// Password hashing (scrypt, no external deps)
+// ---------------------------------------------------------------------------
+function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return { hash, salt };
+}
+function verifyPassword(password, hash, salt) {
+  const check = crypto.scryptSync(password, salt, 64).toString("hex");
+  return crypto.timingSafeEqual(Buffer.from(check), Buffer.from(hash));
+}
+function newToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+// ---------------------------------------------------------------------------
+// Auth middleware — every protected route re-derives the user from the DB.
+// Never trust a username/role sent in the request body.
+// ---------------------------------------------------------------------------
+const sessionStmt = db.prepare(
+  `SELECT s.username, u.role, u.status FROM sessions s
+   JOIN users u ON u.username = s.username WHERE s.token = ?`
+);
+
+function requireAuth(req, res, next) {
+  const token = req.headers["authorization"];
+  if (!token) return res.status(401).json({ error: "Yetkisiz erişim" });
+  const row = sessionStmt.get(token);
+  if (!row || row.status !== "approved") return res.status(401).json({ error: "Geçersiz oturum" });
+  req.user = { username: row.username, role: row.role };
+  req.authToken = token;
+  next();
+}
+
+function requireAdmin(req, res, next) {
+  if (req.user.role !== "admin") return res.status(403).json({ error: "Yönetici yetkisi gerekli" });
+  next();
+}
+
+// ---------------------------------------------------------------------------
+// SSE hub — one connection per logged-in client. Broadcasts are targeted:
+// we only push to sockets belonging to users who are actually in the
+// affected group (or the two DM participants), never a global fan-out scan.
+// ---------------------------------------------------------------------------
+const streamsByUser = new Map(); // username -> Set<res>
+
+function addStream(username, res) {
+  if (!streamsByUser.has(username)) streamsByUser.set(username, new Set());
+  streamsByUser.get(username).add(res);
+}
+function removeStream(username, res) {
+  const set = streamsByUser.get(username);
+  if (!set) return;
+  set.delete(res);
+  if (set.size === 0) streamsByUser.delete(username);
+}
+function sendTo(username, obj) {
+  const set = streamsByUser.get(username);
+  if (!set) return;
+  const line = `data: ${JSON.stringify(obj)}\n\n`;
+  for (const res of set) res.write(line);
+}
+function sendToMany(usernames, obj) {
+  for (const u of usernames) sendTo(u, obj);
+}
+
+const membersOfGroupStmt = db.prepare(`SELECT username FROM group_members WHERE group_token = ?`);
+function groupMemberUsernames(groupToken) {
+  return membersOfGroupStmt.all(groupToken).map(r => r.username);
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot builder (I-FRAME) — used only at connect time / explicit refresh.
+// This is the one "expensive" query; everything after it is incremental.
+// ---------------------------------------------------------------------------
+const friendsForUserStmt = db.prepare(`
+  SELECT f.user1, f.user2, f.status, u.pfp
+  FROM friends f
+  JOIN users u ON u.username = (CASE WHEN f.user1 = ? THEN f.user2 ELSE f.user1 END)
+  WHERE f.user1 = ? OR f.user2 = ?
+`);
+const groupsForUserStmt = db.prepare(`
+  SELECT g.group_token, g.group_name, g.created_by, g.allow_sub_invites
+  FROM groups_t g
+  JOIN group_members gm ON gm.group_token = g.group_token
+  WHERE gm.username = ?
+`);
+
+function buildSnapshot(username) {
+  const friends = friendsForUserStmt.all(username, username, username);
+  const groups = groupsForUserStmt.all(username);
+  const user = db.prepare(`SELECT pfp FROM users WHERE username = ?`).get(username);
+  return { friends, groups, user };
+}
+
+// ---------------------------------------------------------------------------
+// Auth routes
+// ---------------------------------------------------------------------------
+app.post("/api/register", (req, res) => {
+  const username = String(req.body.username || "").toLowerCase().replace(/[^a-z]/g, "");
+  const password = String(req.body.password || "");
+  if (!username || username.length < 3) return res.status(400).json({ error: "Geçersiz kullanıcı adı" });
+  if (!password || password.length < 4) return res.status(400).json({ error: "Şifre çok kısa" });
+
+  const existing = db.prepare(`SELECT username FROM users WHERE username = ?`).get(username);
+  if (existing) return res.status(409).json({ error: "Bu kullanıcı adı zaten alınmış" });
+
+  const { hash, salt } = hashPassword(password);
+  const isFirstUser = db.prepare(`SELECT COUNT(*) c FROM users`).get().c === 0;
+  db.prepare(
+    `INSERT INTO users (username, password_hash, password_salt, role, status, created_at) VALUES (?,?,?,?,?,?)`
+  ).run(username, hash, salt, isFirstUser ? "admin" : "user", isFirstUser ? "approved" : "pending", Date.now());
+
+  res.json({ message: isFirstUser ? "Yönetici hesabı oluşturuldu, giriş yapabilirsiniz." : "Kayıt talebiniz yönetici onayına gönderildi." });
+});
+
+app.post("/api/login", (req, res) => {
+  const username = String(req.body.username || "").toLowerCase().replace(/[^a-z]/g, "");
+  const password = String(req.body.password || "");
+  const user = db.prepare(`SELECT * FROM users WHERE username = ?`).get(username);
+  if (!user || !verifyPassword(password, user.password_hash, user.password_salt)) {
+    return res.status(401).json({ error: "Kullanıcı adı veya şifre hatalı" });
+  }
+  if (user.status !== "approved") return res.status(403).json({ error: "Hesabınız henüz onaylanmadı" });
+
+  const token = newToken();
+  db.prepare(`INSERT INTO sessions (token, username, created_at) VALUES (?,?,?)`).run(token, username, Date.now());
+  res.json({ token, username, role: user.role, pfp: user.pfp || "" });
+});
+
+app.post("/api/logout", requireAuth, (req, res) => {
+  db.prepare(`DELETE FROM sessions WHERE token = ?`).run(req.authToken);
+  res.json({ ok: true });
+});
+
+app.get("/api/public/account-requests", (req, res) => {
+  const pending = db.prepare(`SELECT username FROM users WHERE status = 'pending'`).all().map(r => r.username);
+  const accepted = db.prepare(`SELECT username FROM users WHERE status = 'approved'`).all().map(r => r.username);
+  res.json({ pending, accepted });
+});
+
+// Short-lived single-purpose token for the SSE connection. EventSource can't
+// send Authorization headers, so the real session token never touches a URL.
+app.post("/api/stream/token", requireAuth, (req, res) => {
+  const t = newToken();
+  const expiresAt = Date.now() + 60_000;
+  db.prepare(`INSERT INTO stream_tokens (token, username, expires_at) VALUES (?,?,?)`).run(t, req.user.username, expiresAt);
+  res.json({ streamToken: t });
+});
+
+// ---------------------------------------------------------------------------
+// Snapshot (I-FRAME) — explicit pull, used at boot / reconnect only
+// ---------------------------------------------------------------------------
+app.get("/api/snapshot", requireAuth, (req, res) => {
+  res.json(buildSnapshot(req.user.username));
+});
+
+// ---------------------------------------------------------------------------
+// SSE stream (P-FRAME feed)
+// ---------------------------------------------------------------------------
+app.get("/api/stream", (req, res) => {
+  const streamToken = req.query.token;
+  if (!streamToken) return res.status(401).end();
+
+  const row = db.prepare(`SELECT username, expires_at FROM stream_tokens WHERE token = ?`).get(streamToken);
+  // consume immediately — single use
+  db.prepare(`DELETE FROM stream_tokens WHERE token = ?`).run(streamToken);
+  if (!row || row.expires_at < Date.now()) return res.status(401).end();
+
+  const username = row.username;
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+
+  addStream(username, res);
+  res.write(`data: ${JSON.stringify({ frameType: "I-FRAME", ...buildSnapshot(username) })}\n\n`);
+
+  const keepAlive = setInterval(() => res.write(":ping\n\n"), 25_000);
+  req.on("close", () => {
+    clearInterval(keepAlive);
+    removeStream(username, res);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// User profile picture
+// ---------------------------------------------------------------------------
+app.post("/api/user/pfp", requireAuth, (req, res) => {
+  const pfpBase64 = String(req.body.pfpBase64 || "");
+  if (pfpBase64.length > 600_000) return res.status(413).json({ error: "Görsel çok büyük" });
+  db.prepare(`UPDATE users SET pfp = ? WHERE username = ?`).run(pfpBase64, req.user.username);
+  res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
+// Friends
+// ---------------------------------------------------------------------------
+app.post("/api/friends/request", requireAuth, (req, res) => {
+  const target = String(req.body.targetUsername || "").toLowerCase().replace(/[^a-z]/g, "");
+  if (!target || target === req.user.username) return res.status(400).json({ error: "Geçersiz kullanıcı" });
+  const targetUser = db.prepare(`SELECT username FROM users WHERE username = ? AND status='approved'`).get(target);
+  if (!targetUser) return res.status(404).json({ error: "Kullanıcı bulunamadı" });
+
+  const [u1, u2] = [req.user.username, target].sort();
+  const existing = db.prepare(`SELECT * FROM friends WHERE user1=? AND user2=?`).get(u1, u2);
+  if (existing) return res.status(409).json({ error: "Zaten arkadaşsınız ya da istek bekliyor" });
+
+  db.prepare(`INSERT INTO friends (user1, user2, status, created_at) VALUES (?,?,?,?)`)
+    .run(req.user.username, target, "pending", Date.now()); // store direction: user2 must accept
+  // normalize storage direction so acceptFriend logic below works regardless of sort
+  res.json({ message: "İstek gönderildi" });
+  sendTo(target, { frameType: "P-FRAME", type: "FRIEND_REQUEST", payload: { from: req.user.username } });
+});
+
+app.post("/api/friends/accept", requireAuth, (req, res) => {
+  const target = String(req.body.targetUsername || "").toLowerCase().replace(/[^a-z]/g, "");
+  const row = db.prepare(`SELECT * FROM friends WHERE user1=? AND user2=? AND status='pending'`).get(target, req.user.username);
+  if (!row) return res.status(404).json({ error: "İstek bulunamadı" });
+
+  db.prepare(`UPDATE friends SET status='accepted' WHERE user1=? AND user2=?`).run(target, req.user.username);
+  const pfpA = db.prepare(`SELECT pfp FROM users WHERE username=?`).get(req.user.username).pfp || "";
+  const pfpB = db.prepare(`SELECT pfp FROM users WHERE username=?`).get(target).pfp || "";
+  res.json({ ok: true });
+
+  sendToMany([req.user.username, target], {
+    frameType: "P-FRAME",
+    type: "FRIEND_ACCEPTED",
+    payload: {
+      friendRowFor: { [req.user.username]: { user1: target, user2: req.user.username, status: "accepted", pfp: pfpB },
+                      [target]: { user1: target, user2: req.user.username, status: "accepted", pfp: pfpA } },
+    },
+  });
+});
+
+app.post("/api/friends/unfriend", requireAuth, (req, res) => {
+  const target = String(req.body.targetUsername || "").toLowerCase().replace(/[^a-z]/g, "");
+  const [u1, u2] = [req.user.username, target].sort();
+  const info = db.prepare(`DELETE FROM friends WHERE user1=? AND user2=?`).run(u1, u2);
+  if (info.changes === 0) return res.status(404).json({ error: "Arkadaşlık bulunamadı" });
+  res.json({ ok: true });
+  sendToMany([req.user.username, target], { frameType: "P-FRAME", type: "FRIEND_REMOVED", payload: { user1: u1, user2: u2 } });
+});
+
+// ---------------------------------------------------------------------------
+// DMs — a DM is just a 2-person group with a deterministic token
+// ---------------------------------------------------------------------------
+function dmToken(a, b) { return "dm_" + [a, b].sort().join("_"); }
+
+app.post("/api/dm/open", requireAuth, (req, res) => {
+  const target = String(req.body.targetUsername || "").toLowerCase().replace(/[^a-z]/g, "");
+  const [u1, u2] = [req.user.username, target].sort();
+  const friendRow = db.prepare(`SELECT status FROM friends WHERE user1=? AND user2=?`).get(u1, u2);
+  if (!friendRow || friendRow.status !== "accepted") return res.status(403).json({ error: "Önce arkadaş olmalısınız" });
+
+  const gt = dmToken(req.user.username, target);
+  const existing = db.prepare(`SELECT group_token FROM groups_t WHERE group_token = ?`).get(gt);
+  if (!existing) {
+    const now = Date.now();
+    db.prepare(`INSERT INTO groups_t (group_token, group_name, created_by, allow_sub_invites, created_at) VALUES (?,?,?,?,?)`)
+      .run(gt, "@" + target, req.user.username, 0, now);
+    db.prepare(`INSERT INTO group_members (group_token, username, can_add_members, joined_at) VALUES (?,?,?,?)`).run(gt, req.user.username, 0, now);
+    db.prepare(`INSERT INTO group_members (group_token, username, can_add_members, joined_at) VALUES (?,?,?,?)`).run(gt, target, 0, now);
+  }
+  res.json({ groupToken: gt });
+});
+
+// ---------------------------------------------------------------------------
+// Groups
+// ---------------------------------------------------------------------------
+app.post("/api/groups/create", requireAuth, (req, res) => {
+  const groupName = String(req.body.groupName || "").trim().slice(0, 60);
+  if (!groupName) return res.status(400).json({ error: "Grup adı gerekli" });
+  const gt = crypto.randomBytes(12).toString("hex");
+  const now = Date.now();
+  db.prepare(`INSERT INTO groups_t (group_token, group_name, created_by, allow_sub_invites, created_at) VALUES (?,?,?,1,?)`)
+    .run(gt, groupName, req.user.username, now);
+  db.prepare(`INSERT INTO group_members (group_token, username, can_add_members, joined_at) VALUES (?,?,1,?)`).run(gt, req.user.username, now);
+  res.json({ message: "Grup oluşturuldu", groupToken: gt });
+});
+
+function isMember(groupToken, username) {
+  return !!db.prepare(`SELECT 1 FROM group_members WHERE group_token=? AND username=?`).get(groupToken, username);
+}
+function isOwnerOrAdmin(group, user) {
+  return group.created_by === user.username || user.role === "admin";
+}
+
+app.get("/api/groups/:token/members", requireAuth, (req, res) => {
+  const gt = req.params.token;
+  const group = db.prepare(`SELECT * FROM groups_t WHERE group_token = ?`).get(gt);
+  if (!group) return res.status(404).json({ error: "Grup bulunamadı" });
+  if (!isMember(gt, req.user.username)) return res.status(403).json({ error: "Bu grubun üyesi değilsiniz" });
+
+  const members = db.prepare(`
+    SELECT gm.username, gm.can_add_members, u.pfp
+    FROM group_members gm JOIN users u ON u.username = gm.username
+    WHERE gm.group_token = ?
+  `).all(gt);
+
+  res.json({ groupInfo: group, members });
+});
+
+app.post("/api/groups/add-member", requireAuth, (req, res) => {
+  const { groupToken, targetUsername } = req.body;
+  const target = String(targetUsername || "").toLowerCase().replace(/[^a-z]/g, "");
+  const group = db.prepare(`SELECT * FROM groups_t WHERE group_token = ?`).get(groupToken);
+  if (!group) return res.status(404).json({ error: "Grup bulunamadı" });
+
+  const me = db.prepare(`SELECT * FROM group_members WHERE group_token=? AND username=?`).get(groupToken, req.user.username);
+  if (!me) return res.status(403).json({ error: "Bu grubun üyesi değilsiniz" });
+
+  const owner = isOwnerOrAdmin(group, req.user);
+  const canInvite = owner || (group.allow_sub_invites && me.can_add_members);
+  if (!canInvite) return res.status(403).json({ error: "Üye ekleme yetkiniz yok" });
+
+  // must be friends to add to a group (mirrors DM rule) — also confirms target exists
+  const [u1, u2] = [req.user.username, target].sort();
+  const friendRow = db.prepare(`SELECT status FROM friends WHERE user1=? AND user2=?`).get(u1, u2);
+  if (!friendRow || friendRow.status !== "accepted") return res.status(403).json({ error: "Sadece arkadaşlarınızı ekleyebilirsiniz" });
+
+  if (isMember(groupToken, target)) return res.status(409).json({ error: "Kullanıcı zaten grupta" });
+
+  const now = Date.now();
+  db.prepare(`INSERT INTO group_members (group_token, username, can_add_members, joined_at) VALUES (?,?,1,?)`).run(groupToken, target, now);
+  const newMember = { username: target, can_add_members: 1, pfp: db.prepare(`SELECT pfp FROM users WHERE username=?`).get(target).pfp || "" };
+
+  res.json({ message: "Üye eklendi" });
+
+  const recipients = [...groupMemberUsernames(groupToken)]; // includes target now
+  sendToMany(recipients, { frameType: "P-FRAME", type: "GROUP_MEMBER_ADDED", payload: { groupToken, newMember, group } });
+});
+
+app.post("/api/groups/remove-member", requireAuth, (req, res) => {
+  const { groupToken, targetUsername } = req.body;
+  const group = db.prepare(`SELECT * FROM groups_t WHERE group_token = ?`).get(groupToken);
+  if (!group) return res.status(404).json({ error: "Grup bulunamadı" });
+  if (!isOwnerOrAdmin(group, req.user)) return res.status(403).json({ error: "Yetkiniz yok" });
+  if (targetUsername === group.created_by) return res.status(400).json({ error: "Kurucu çıkarılamaz" });
+
+  const recipientsBefore = groupMemberUsernames(groupToken);
+  db.prepare(`DELETE FROM group_members WHERE group_token=? AND username=?`).run(groupToken, targetUsername);
+  res.json({ ok: true });
+  sendToMany(recipientsBefore, { frameType: "P-FRAME", type: "GROUP_MEMBER_LEFT", payload: { groupToken, username: targetUsername } });
+});
+
+app.post("/api/groups/leave", requireAuth, (req, res) => {
+  const { groupToken } = req.body;
+  const group = db.prepare(`SELECT * FROM groups_t WHERE group_token = ?`).get(groupToken);
+  if (!group) return res.status(404).json({ error: "Grup bulunamadı" });
+  if (group.created_by === req.user.username) return res.status(400).json({ error: "Kurucu gruptan ayrılamaz, grubu silin" });
+  if (!isMember(groupToken, req.user.username)) return res.status(403).json({ error: "Bu grubun üyesi değilsiniz" });
+
+  const recipientsBefore = groupMemberUsernames(groupToken);
+  db.prepare(`DELETE FROM group_members WHERE group_token=? AND username=?`).run(groupToken, req.user.username);
+  res.json({ ok: true });
+  sendToMany(recipientsBefore, { frameType: "P-FRAME", type: "GROUP_MEMBER_LEFT", payload: { groupToken, username: req.user.username } });
+});
+
+app.post("/api/groups/toggle-sub-invites", requireAuth, (req, res) => {
+  const { groupToken, allowSubInvites } = req.body;
+  const group = db.prepare(`SELECT * FROM groups_t WHERE group_token = ?`).get(groupToken);
+  if (!group) return res.status(404).json({ error: "Grup bulunamadı" });
+  if (!isOwnerOrAdmin(group, req.user)) return res.status(403).json({ error: "Yetkiniz yok" });
+
+  const val = allowSubInvites ? 1 : 0;
+  db.prepare(`UPDATE groups_t SET allow_sub_invites=? WHERE group_token=?`).run(val, groupToken);
+  res.json({ ok: true });
+  sendToMany(groupMemberUsernames(groupToken), {
+    frameType: "P-FRAME", type: "GROUP_SETTING_UPDATED", payload: { groupToken, allow_sub_invites: val },
+  });
+});
+
+app.post("/api/groups/toggle-member-invite-perm", requireAuth, (req, res) => {
+  const { groupToken, targetUsername, canAddMembers } = req.body;
+  const group = db.prepare(`SELECT * FROM groups_t WHERE group_token = ?`).get(groupToken);
+  if (!group) return res.status(404).json({ error: "Grup bulunamadı" });
+  if (!isOwnerOrAdmin(group, req.user)) return res.status(403).json({ error: "Yetkiniz yok" });
+
+  const val = canAddMembers ? 1 : 0;
+  db.prepare(`UPDATE group_members SET can_add_members=? WHERE group_token=? AND username=?`).run(val, groupToken, targetUsername);
+  res.json({ ok: true });
+  sendToMany(groupMemberUsernames(groupToken), {
+    frameType: "P-FRAME", type: "GROUP_PERM_UPDATED", payload: { groupToken, username: targetUsername, can_add_members: val },
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Messages — paginated, cursor-based. Never returns more than `limit`.
+// ---------------------------------------------------------------------------
+app.get("/api/messages/:token", requireAuth, (req, res) => {
+  const gt = req.params.token;
+  if (!isMember(gt, req.user.username)) return res.status(403).json({ error: "Bu grubun üyesi değilsiniz" });
+
+  const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
+  const before = req.query.before ? parseInt(req.query.before, 10) : null;
+
+  let rows;
+  if (before) {
+    rows = db.prepare(
+      `SELECT * FROM messages WHERE group_token = ? AND id < ? ORDER BY id DESC LIMIT ?`
+    ).all(gt, before, limit);
+  } else {
+    rows = db.prepare(
+      `SELECT * FROM messages WHERE group_token = ? ORDER BY id DESC LIMIT ?`
+    ).all(gt, limit);
+  }
+  rows.reverse(); // oldest -> newest for the client
+
+  // attach sender pfp without N+1: single IN() query
+  const senders = [...new Set(rows.map(r => r.sender))];
+  if (senders.length) {
+    const placeholders = senders.map(() => "?").join(",");
+    const pfps = db.prepare(`SELECT username, pfp FROM users WHERE username IN (${placeholders})`).all(...senders);
+    const pfpMap = Object.fromEntries(pfps.map(p => [p.username, p.pfp || ""]));
+    for (const r of rows) r.pfp = pfpMap[r.sender] || "";
+  }
+
+  res.json(rows);
+});
+
+app.post("/api/messages/send", requireAuth, (req, res) => {
+  const { groupToken, content, replyToSender, replyToContent } = req.body;
+  if (!isMember(groupToken, req.user.username)) return res.status(403).json({ error: "Bu grubun üyesi değilsiniz" });
+  if (!content || typeof content !== "string") return res.status(400).json({ error: "Geçersiz mesaj" });
+  if (content.startsWith("data:image/")) {
+    if (content.length > 1_400_000) return res.status(413).json({ error: "Görsel çok büyük" });
+  } else if (content.length > 4000) {
+    return res.status(413).json({ error: "Mesaj çok uzun" });
+  }
+
+  const now = Date.now();
+  const info = db.prepare(
+    `INSERT INTO messages (group_token, sender, content, reply_to_sender, reply_to_content, created_at) VALUES (?,?,?,?,?,?)`
+  ).run(groupToken, req.user.username, content, replyToSender || null, replyToContent || null, now);
+
+  const pfp = db.prepare(`SELECT pfp FROM users WHERE username=?`).get(req.user.username).pfp || "";
+  const payload = {
+    id: info.lastInsertRowid,
+    group_token: groupToken,
+    sender: req.user.username,
+    content,
+    reply_to_sender: replyToSender || null,
+    reply_to_content: replyToContent || null,
+    created_at: now,
+    pfp,
+  };
+
+  res.json({ ok: true, id: info.lastInsertRowid });
+  sendToMany(groupMemberUsernames(groupToken), { frameType: "P-FRAME", type: "NEW_MESSAGE", payload });
+});
+
+app.post("/api/messages/delete", requireAuth, (req, res) => {
+  const { messageId, groupToken } = req.body;
+  const msg = db.prepare(`SELECT * FROM messages WHERE id = ? AND group_token = ?`).get(messageId, groupToken);
+  if (!msg) return res.status(404).json({ error: "Mesaj bulunamadı" });
+
+  const group = db.prepare(`SELECT * FROM groups_t WHERE group_token = ?`).get(groupToken);
+  const canDelete = msg.sender === req.user.username || isOwnerOrAdmin(group, req.user);
+  if (!canDelete) return res.status(403).json({ error: "Bu mesajı silme yetkiniz yok" });
+
+  db.prepare(`DELETE FROM messages WHERE id = ?`).run(messageId);
+  res.json({ ok: true });
+  sendToMany(groupMemberUsernames(groupToken), {
+    frameType: "P-FRAME", type: "MESSAGE_DELETED", payload: { messageId, groupToken },
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Admin
+// ---------------------------------------------------------------------------
+app.get("/api/admin/pending", requireAuth, requireAdmin, (req, res) => {
+  res.json(db.prepare(`SELECT rowid as id, username FROM users WHERE status='pending'`).all());
+});
+
+app.get("/api/admin/users", requireAuth, requireAdmin, (req, res) => {
+  res.json(db.prepare(`SELECT username, role FROM users WHERE status='approved'`).all());
+});
+
+app.post("/api/admin/action", requireAuth, requireAdmin, (req, res) => {
+  const { id, action } = req.body;
+  const user = db.prepare(`SELECT * FROM users WHERE rowid = ?`).get(id);
+  if (!user) return res.status(404).json({ error: "Kullanıcı bulunamadı" });
+
+  if (action === "approve") db.prepare(`UPDATE users SET status='approved' WHERE rowid=?`).run(id);
+  else if (action === "deny") db.prepare(`DELETE FROM users WHERE rowid=?`).run(id);
+  else return res.status(400).json({ error: "Geçersiz işlem" });
+
+  res.json({ ok: true });
+});
+
+app.post("/api/admin/delete-user", requireAuth, requireAdmin, (req, res) => {
+  const { username } = req.body;
+  if (username === req.user.username) return res.status(400).json({ error: "Kendinizi silemezsiniz" });
+  const info = db.prepare(`DELETE FROM users WHERE username = ?`).run(username);
+  if (info.changes === 0) return res.status(404).json({ error: "Kullanıcı bulunamadı" });
+  db.prepare(`DELETE FROM sessions WHERE username = ?`).run(username);
+  res.json({ message: "Kullanıcı silindi" });
+});
+
+// ---------------------------------------------------------------------------
+// Static client + housekeeping
+// ---------------------------------------------------------------------------
+app.use(express.static(path.join(__dirname, "public")));
+
+// prune expired stream tokens / stale sessions periodically (cheap, in-process)
+setInterval(() => {
+  db.prepare(`DELETE FROM stream_tokens WHERE expires_at < ?`).run(Date.now());
+}, 60_000);
+
+app.listen(PORT, () => console.log(`SOPERT server listening on :${PORT}`));
