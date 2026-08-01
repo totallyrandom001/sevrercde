@@ -1,16 +1,13 @@
 {
-  "name": "sopert-server",
-  "version": "2.1.0",
+  "name": "sopert-vaio",
+  "version": "1.0.0",
   "private": true,
-  "main": "server.js",
+  "main": "run.js",
   "scripts": {
-    "start": "node server.js"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "start": "node run.js"
   },
   "dependencies": {
-    "better-sqlite3": "^9.6.0",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "better-sqlite3": "^11.3.0"
   }
 }
