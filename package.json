@@ -1,13 +1,15 @@
 {
-  "name": "sopert-vaio",
+  "name": "sopert-relay",
   "version": "1.0.0",
   "private": true,
-  "main": "run.js",
+  "main": "relay-server.js",
+  "engines": { "node": ">=18" },
   "scripts": {
-    "start": "node run.js"
+    "start": "node relay-server.js"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "better-sqlite3": "^11.3.0"
+    "express-rate-limit": "^7.4.0",
+    "http-proxy-middleware": "^2.0.6"
   }
 }
