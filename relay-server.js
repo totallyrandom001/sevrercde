@@ -239,4 +239,79 @@ app.use("/", requireTunnel, createProxyMiddleware({
   },
 }));
 
-app.listen(PORT, () => console.log(`[relay] listening on :${PORT}`));
+const httpServer = app.listen(PORT, () =>
+  console.log(`[relay] listening on :${PORT}`)
+);
+
+// ── WebSocket bridge (/api/client-stream) ───────────────────────────────────
+// http-proxy-middleware cannot proxy WebSocket connections in this config
+// (ws: false, and Render's infrastructure strips the Upgrade header anyway).
+// We bridge manually: accept the upgrade from the browser, open a matching WS
+// to the VAIO tunnel, and pipe frames both ways.
+const wssRelay = new WebSocketServer({ noServer: true });
+
+httpServer.on('upgrade', (req, socket, head) => {
+  if (!req.url?.startsWith('/api/client-stream')) {
+    socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  // CORS check — same origins the HTTP middleware allows
+  const origin = req.headers.origin;
+  const allowed = [ALLOWED_ORIGIN, 'http://localhost:3000', 'http://127.0.0.1:3000'];
+  if (!allowed.includes(origin)) {
+    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  if (!tunnelUrl) {
+    socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  // Build the upstream WS URL
+  const vaioWsUrl = tunnelUrl.replace(/^http/, 'ws') + req.url;
+  console.log(`[relay] WS bridge → ${vaioWsUrl}`);
+
+  const upstream = new WsClient(vaioWsUrl, {
+    headers: {
+      ...req.headers,
+      host: new URL(tunnelUrl).hostname,
+    },
+  });
+
+  wssRelay.handleUpgrade(req, socket, head, (clientWs) => {
+    // Wait for upstream to open before completing the handshake with the browser
+    upstream.on('open', () => {
+      clientWs.on('message', (data, isBinary) => {
+        if (upstream.readyState === WsClient.OPEN) upstream.send(data, { binary: isBinary });
+      });
+      upstream.on('message', (data, isBinary) => {
+        if (clientWs.readyState === WsClient.OPEN) clientWs.send(data, { binary: isBinary });
+      });
+
+      const closeUpstream = (code, reason) => {
+        if (upstream.readyState < WsClient.CLOSING) upstream.close(code, reason);
+      };
+      const closeClient = (code, reason) => {
+        if (clientWs.readyState < WsClient.CLOSING) clientWs.close(code, reason);
+      };
+
+      clientWs.on('close', (code, reason) => closeUpstream(code, reason));
+      upstream.on('close',  (code, reason) => closeClient(code, reason));
+      clientWs.on('error',  () => closeUpstream(1011, 'Client error'));
+      upstream.on('error',  (err) => {
+        console.error('[relay] WS upstream error:', err.message);
+        closeClient(1011, 'Upstream error');
+      });
+    });
+
+    upstream.on('error', (err) => {
+      console.error('[relay] WS upstream failed to open:', err.message);
+      if (clientWs.readyState < WsClient.CLOSING) clientWs.close(1011, 'Upstream unreachable');
+    });
+  });
+});
