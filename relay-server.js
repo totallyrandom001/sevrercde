@@ -58,6 +58,7 @@ app.get("/relay-status", (_req, res) =>
 );
 
 app.get("/ping", async (_req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
   try {
     const response = await fetch(TUNNEL_URL + "/ping");
     if (response.ok) return res.status(200).json({ ok: true });
