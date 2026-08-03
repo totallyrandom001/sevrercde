@@ -41,6 +41,60 @@ if (typeof dns.setDefaultResultOrder === "function") {
   console.warn("[relay] dns.setDefaultResultOrder unavailable on this Node version — IPv6 ENETUNREACH risk remains");
 }
 
+// ============================================================================
+// [FIX] ENOTFOUND root cause, confirmed via /debug-connectivity: Render's own
+// DNS infrastructure cannot resolve *.ts.net hostnames at all — dns.lookup,
+// dns.resolve4, AND dns.resolve6 all fail identically and instantly (2ms,
+// meaning it never even reaches the network — it's a resolver-level dead
+// end on Render's side specifically). Public checkers (whatsmydns.net)
+// confirm the hostname resolves consistently worldwide to a fixed set of
+// IPs, so the record is fine — Render's resolver just can't/won't reach
+// Tailscale's authoritative nameservers for this TLD.
+//
+// Workaround: bypass DNS resolution for this one hostname entirely by
+// monkey-patching dns.lookup to return a hardcoded, known-good IP whenever
+// it's asked to resolve the tunnel hostname specifically. Everything else
+// (any other hostname) still goes through the real resolver untouched.
+//
+// This is safe for TLS: we are NOT skipping certificate validation — we're
+// only substituting which IP the TCP connection dials. The TLS handshake
+// still sends the real hostname via SNI (Node does this automatically based
+// on the `host`/`servername` used in the request, not the resolved IP), so
+// the certificate Tailscale Funnel presents is still checked against
+// "desktop-hbhqdgt.tail966c62.ts.net" as normal, and the Host header is
+// still sent correctly for Funnel's own internal routing.
+//
+// CAVEAT: if Tailscale ever rotates the Funnel edge IPs, this hardcoded list
+// needs updating. Re-check via whatsmydns.net (#A/<your-hostname>) if this
+// workaround suddenly stops working after previously succeeding.
+// ============================================================================
+const TUNNEL_HOSTNAME = new URL(process.env.TUNNEL_URL.replace(/\/$/, "")).hostname;
+const KNOWN_FUNNEL_IPS = ["176.58.88.108", "176.58.88.82", "176.58.92.199"];
+let _funnelIpRotation = 0;
+
+const _realDnsLookup = dns.lookup.bind(dns);
+dns.lookup = function patchedLookup(hostname, options, callback) {
+  // Normalize the (hostname, options, callback) vs (hostname, callback) overload.
+  if (typeof options === "function") {
+    callback = options;
+    options = {};
+  }
+  options = options || {};
+
+  if (hostname === TUNNEL_HOSTNAME) {
+    const ip = KNOWN_FUNNEL_IPS[_funnelIpRotation % KNOWN_FUNNEL_IPS.length];
+    _funnelIpRotation++;
+    console.log(`[relay] DNS bypass — serving hardcoded IP for ${hostname} -> ${ip}`);
+    if (options.all) {
+      return callback(null, KNOWN_FUNNEL_IPS.map((addr) => ({ address: addr, family: 4 })));
+    }
+    return callback(null, ip, 4);
+  }
+
+  return _realDnsLookup(hostname, options, callback);
+};
+console.log(`[relay] DNS bypass installed for ${TUNNEL_HOSTNAME} -> [${KNOWN_FUNNEL_IPS.join(", ")}]`);
+
 const PORT           = process.env.PORT || 10000;
 const RELAY_SECRET   = process.env.RELAY_SECRET;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "https://totallyrandom001.github.io";
