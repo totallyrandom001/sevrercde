@@ -16,7 +16,9 @@
 const express   = require("express");
 const https     = require("https");
 const http      = require("http");
-const dns       = require("dns");           // [DEBUG] for diagnostic endpoint
+const tls       = require("tls");
+const net       = require("net");
+const dns       = require("dns");
 const rateLimit = require("express-rate-limit");
 const { createProxyMiddleware }      = require("http-proxy-middleware");
 const { WebSocketServer, WebSocket: WsClient } = require("ws");   // npm install ws
@@ -42,39 +44,30 @@ if (typeof dns.setDefaultResultOrder === "function") {
 }
 
 // ============================================================================
-// [FIX] ENOTFOUND root cause, confirmed via /debug-connectivity: Render's own
-// DNS infrastructure cannot resolve *.ts.net hostnames at all — dns.lookup,
-// dns.resolve4, AND dns.resolve6 all fail identically and instantly (2ms,
-// meaning it never even reaches the network — it's a resolver-level dead
-// end on Render's side specifically). Public checkers (whatsmydns.net)
-// confirm the hostname resolves consistently worldwide to a fixed set of
-// IPs, so the record is fine — Render's resolver just can't/won't reach
-// Tailscale's authoritative nameservers for this TLD.
+// [FIX] "Try every way" adaptive connection layer.
 //
-// Workaround: bypass DNS resolution for this one hostname entirely by
-// monkey-patching dns.lookup to return a hardcoded, known-good IP whenever
-// it's asked to resolve the tunnel hostname specifically. Everything else
-// (any other hostname) still goes through the real resolver untouched.
+// Prior evidence: DNS resolution is unreliable from Render (sometimes
+// ENOTFOUND, sometimes succeeds), and even when DNS succeeds, EVERY TLS
+// handshake attempt to every known Funnel IP fails identically —
+// "Client network socket disconnected before secure TLS connection was
+// established" (ECONNRESET at the TLS layer, not routing/DNS). That
+// signature points at something on the Funnel edge fingerprinting/filtering
+// based on the TLS ClientHello (protocol version, ALPN list) or on Render's
+// IP/ASN — not the destination.
 //
-// This is safe for TLS: we are NOT skipping certificate validation — we're
-// only substituting which IP the TCP connection dials. The TLS handshake
-// still sends the real hostname via SNI (Node does this automatically based
-// on the `host`/`servername` used in the request, not the resolved IP), so
-// the certificate Tailscale Funnel presents is still checked against
-// "desktop-hbhqdgt.tail966c62.ts.net" as normal, and the Host header is
-// still sent correctly for Funnel's own internal routing.
-//
-// CAVEAT: if Tailscale ever rotates the Funnel edge IPs, this hardcoded list
-// needs updating. Re-check via whatsmydns.net (#A/<your-hostname>) if this
-// workaround suddenly stops working after previously succeeding.
+// This bypasses DNS entirely (hardcoded known-good IPs) AND probes every
+// realistic TLS version/ALPN combination against every known IP at boot,
+// remembering whichever combination actually completes a handshake and gets
+// a real HTTP response back. All proxying then reuses that winning
+// combination via a custom Agent. If a previously-working combination
+// starts failing live, it automatically re-probes in the background.
 // ============================================================================
-const TUNNEL_HOSTNAME = new URL(process.env.TUNNEL_URL.replace(/\/$/, "")).hostname;
+const TUNNEL_HOSTNAME  = new URL(process.env.TUNNEL_URL.replace(/\/$/, "")).hostname;
 const KNOWN_FUNNEL_IPS = ["176.58.88.108", "176.58.88.82", "176.58.92.199"];
-let _funnelIpRotation = 0;
+let _funnelIpRotation  = 0;
 
 const _realDnsLookup = dns.lookup.bind(dns);
 dns.lookup = function patchedLookup(hostname, options, callback) {
-  // Normalize the (hostname, options, callback) vs (hostname, callback) overload.
   if (typeof options === "function") {
     callback = options;
     options = {};
@@ -82,18 +75,105 @@ dns.lookup = function patchedLookup(hostname, options, callback) {
   options = options || {};
 
   if (hostname === TUNNEL_HOSTNAME) {
-    const ip = KNOWN_FUNNEL_IPS[_funnelIpRotation % KNOWN_FUNNEL_IPS.length];
-    _funnelIpRotation++;
-    console.log(`[relay] DNS bypass — serving hardcoded IP for ${hostname} -> ${ip}`);
+    const ip = (bestConnection && bestConnection.ip)
+      || KNOWN_FUNNEL_IPS[_funnelIpRotation++ % KNOWN_FUNNEL_IPS.length];
     if (options.all) {
       return callback(null, KNOWN_FUNNEL_IPS.map((addr) => ({ address: addr, family: 4 })));
     }
     return callback(null, ip, 4);
   }
-
   return _realDnsLookup(hostname, options, callback);
 };
-console.log(`[relay] DNS bypass installed for ${TUNNEL_HOSTNAME} -> [${KNOWN_FUNNEL_IPS.join(", ")}]`);
+
+const TLS_COMBOS = [
+  { label: "TLS1.3-only, ALPN h1", minVersion: "TLSv1.3", maxVersion: "TLSv1.3", ALPNProtocols: ["http/1.1"] },
+  { label: "TLS1.2-only, ALPN h1", minVersion: "TLSv1.2", maxVersion: "TLSv1.2", ALPNProtocols: ["http/1.1"] },
+  { label: "TLS1.2-1.3, ALPN h1",  minVersion: "TLSv1.2", maxVersion: "TLSv1.3", ALPNProtocols: ["http/1.1"] },
+  { label: "TLS1.2-only, no ALPN", minVersion: "TLSv1.2", maxVersion: "TLSv1.2", ALPNProtocols: undefined },
+  { label: "TLS1.3-only, no ALPN", minVersion: "TLSv1.3", maxVersion: "TLSv1.3", ALPNProtocols: undefined },
+  { label: "default negotiation",  minVersion: undefined, maxVersion: undefined, ALPNProtocols: undefined },
+];
+
+let bestConnection   = null; // { ip, combo } once a working one is found
+let probeInProgress  = false;
+
+function probeOnce(ip, combo, cb) {
+  let done = false;
+  const socket = tls.connect({
+    host: ip,
+    port: 443,
+    servername: TUNNEL_HOSTNAME, // SNI preserved — cert still validates normally
+    minVersion: combo.minVersion,
+    maxVersion: combo.maxVersion,
+    ALPNProtocols: combo.ALPNProtocols,
+    timeout: 6000,
+  });
+  const finish = (ok, err) => {
+    if (done) return;
+    done = true;
+    try { socket.destroy(); } catch {}
+    cb(ok, err);
+  };
+  socket.once("secureConnect", () => {
+    socket.write(`GET / HTTP/1.1\r\nHost: ${TUNNEL_HOSTNAME}\r\nConnection: close\r\n\r\n`);
+    let body = "";
+    socket.on("data", (chunk) => { body += chunk.toString(); });
+    socket.on("end", () => finish(body.length > 0, null));
+  });
+  socket.once("timeout", () => finish(false, "TIMEOUT"));
+  socket.once("error",   (err) => finish(false, err.code || err.message));
+}
+
+function probeAllCombinations(onComplete) {
+  if (probeInProgress) return;
+  probeInProgress = true;
+
+  const attempts = [];
+  for (const ip of KNOWN_FUNNEL_IPS) for (const combo of TLS_COMBOS) attempts.push({ ip, combo });
+
+  let i = 0;
+  function next() {
+    if (i >= attempts.length) {
+      probeInProgress = false;
+      console.error("[relay] ALL connection combinations failed.");
+      onComplete(null);
+      return;
+    }
+    const { ip, combo } = attempts[i++];
+    probeOnce(ip, combo, (ok, err) => {
+      if (ok) {
+        console.log(`[relay] WORKING combination found: ip=${ip} tls="${combo.label}"`);
+        bestConnection = { ip, combo };
+        probeInProgress = false;
+        onComplete(bestConnection);
+        return;
+      }
+      console.warn(`[relay] failed: ip=${ip} tls="${combo.label}" error=${err}`);
+      next();
+    });
+  }
+  next();
+}
+
+probeAllCombinations(() => {}); // run once at boot; re-runs automatically on live failure
+
+class AdaptiveHttpsAgent extends https.Agent {
+  createConnection(options, callback) {
+    const chosen = bestConnection || { ip: KNOWN_FUNNEL_IPS[0], combo: TLS_COMBOS[0] };
+    const socket = tls.connect({
+      ...options,
+      host: chosen.ip,
+      servername: TUNNEL_HOSTNAME,
+      minVersion: chosen.combo.minVersion,
+      maxVersion: chosen.combo.maxVersion,
+      ALPNProtocols: chosen.combo.ALPNProtocols,
+    });
+    socket.once("error", () => { if (!probeInProgress) probeAllCombinations(() => {}); });
+    if (callback) socket.once("secureConnect", () => callback(null, socket));
+    return socket;
+  }
+}
+const adaptiveAgent = new AdaptiveHttpsAgent({ keepAlive: true, maxSockets: 20 });
 
 const PORT           = process.env.PORT || 10000;
 const RELAY_SECRET   = process.env.RELAY_SECRET;
@@ -275,7 +355,8 @@ app.get("/api/stream", requireTunnel, (req, res) => {
       path:     target.pathname + target.search,
       method:   "GET",
       headers:  proxyHeaders,
-      family:   4, // [FIX] explicit IPv4-only, in addition to the global dns.setDefaultResultOrder fix above
+      family:   4,
+      agent:    target.protocol === "https:" ? adaptiveAgent : undefined, // [FIX] use the working TLS/IP combo
     },
     (proxyRes) => {
       if (proxyRes.statusCode < 200 || proxyRes.statusCode >= 300) {
@@ -344,6 +425,7 @@ app.use("/", requireTunnel, createProxyMiddleware({
   changeOrigin: true,
   ws:           false,
   logLevel:     "warn",
+  agent:        adaptiveAgent, // [FIX] route through the working TLS/IP combo, not default negotiation
   onProxyRes: (proxyRes) => {
     delete proxyRes.headers["access-control-allow-origin"];
     delete proxyRes.headers["access-control-allow-methods"];
@@ -351,7 +433,8 @@ app.use("/", requireTunnel, createProxyMiddleware({
     delete proxyRes.headers["vary"];
   },
   onError: (err, req, res) => {
-    console.error("[relay] proxy error:", err.message);
+    console.error("[relay] proxy error:", err.code || err.message, "— current best connection:", bestConnection);
+    if (!probeInProgress) probeAllCombinations(() => {});
     if (!res.headersSent) res.status(502).json({ error: "VAIO bağlantısı başarısız" });
   },
 }));
