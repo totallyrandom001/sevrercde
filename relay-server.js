@@ -1,3 +1,13 @@
+// ============================================================================
+// SOPERT RELAY — Render
+// Chain: Frontend → Render (this) → ngrok → VAIO :3000
+//
+// Env vars to set in Render dashboard:
+//   TUNNEL_URL     = https://latticed-hunting-causing.ngrok-free.dev
+//   RELAY_SECRET   = (your secret)
+//   ALLOWED_ORIGIN = https://totallyrandom001.github.io
+// ============================================================================
+
 const express    = require("express");
 const rateLimit  = require("express-rate-limit");
 const { createProxyMiddleware } = require("http-proxy-middleware");
@@ -46,6 +56,16 @@ app.use((req, res, next) => {
 app.get("/relay-status", (_req, res) =>
   res.json({ ok: true })
 );
+
+app.get("/ping", async (_req, res) => {
+  try {
+    const response = await fetch(TUNNEL_URL + "/ping");
+    if (response.ok) return res.status(200).json({ ok: true });
+    return res.status(999).json({ ok: false });
+  } catch {
+    return res.status(999).json({ ok: false });
+  }
+});
 
 // ── Rate limit ───────────────────────────────────────────────────────────────
 app.use(rateLimit({ windowMs: 60_000, max: 200 }));
