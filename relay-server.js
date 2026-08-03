@@ -16,164 +16,9 @@
 const express   = require("express");
 const https     = require("https");
 const http      = require("http");
-const tls       = require("tls");
-const net       = require("net");
-const dns       = require("dns");
 const rateLimit = require("express-rate-limit");
 const { createProxyMiddleware }      = require("http-proxy-middleware");
 const { WebSocketServer, WebSocket: WsClient } = require("ws");   // npm install ws
-
-// ============================================================================
-// [FIX] ENETUNREACH root cause: the tunnel hostname resolves to both IPv4 and
-// IPv6 addresses, and Render's outbound network does not route IPv6 traffic.
-// Node's default DNS behavior can return/prefer the IPv6 address first, so
-// http-proxy-middleware (and any raw https.request) ends up trying to dial
-// an address with literally no outbound route -> ENETUNREACH.
-//
-// Forcing ipv4first here makes dns.lookup() -- which is what Node's http/https
-// modules use internally to resolve a hostname before connecting -- always
-// return IPv4 addresses ahead of IPv6 ones, so every outbound connection
-// (the manual SSE request, the WS bridge, and http-proxy-middleware's
-// internal requests) picks an address Render can actually route to.
-// ============================================================================
-if (typeof dns.setDefaultResultOrder === "function") {
-  dns.setDefaultResultOrder("ipv4first");
-  console.log("[relay] DNS result order forced to ipv4first (fix for ENETUNREACH on IPv6-less egress)");
-} else {
-  console.warn("[relay] dns.setDefaultResultOrder unavailable on this Node version — IPv6 ENETUNREACH risk remains");
-}
-
-// ============================================================================
-// [FIX] "Try every way" adaptive connection layer.
-//
-// Prior evidence: DNS resolution is unreliable from Render (sometimes
-// ENOTFOUND, sometimes succeeds), and even when DNS succeeds, EVERY TLS
-// handshake attempt to every known Funnel IP fails identically —
-// "Client network socket disconnected before secure TLS connection was
-// established" (ECONNRESET at the TLS layer, not routing/DNS). That
-// signature points at something on the Funnel edge fingerprinting/filtering
-// based on the TLS ClientHello (protocol version, ALPN list) or on Render's
-// IP/ASN — not the destination.
-//
-// This bypasses DNS entirely (hardcoded known-good IPs) AND probes every
-// realistic TLS version/ALPN combination against every known IP at boot,
-// remembering whichever combination actually completes a handshake and gets
-// a real HTTP response back. All proxying then reuses that winning
-// combination via a custom Agent. If a previously-working combination
-// starts failing live, it automatically re-probes in the background.
-// ============================================================================
-const TUNNEL_HOSTNAME  = new URL(process.env.TUNNEL_URL.replace(/\/$/, "")).hostname;
-const KNOWN_FUNNEL_IPS = ["176.58.88.108", "176.58.88.82", "176.58.92.199"];
-let _funnelIpRotation  = 0;
-
-const _realDnsLookup = dns.lookup.bind(dns);
-dns.lookup = function patchedLookup(hostname, options, callback) {
-  if (typeof options === "function") {
-    callback = options;
-    options = {};
-  }
-  options = options || {};
-
-  if (hostname === TUNNEL_HOSTNAME) {
-    const ip = (bestConnection && bestConnection.ip)
-      || KNOWN_FUNNEL_IPS[_funnelIpRotation++ % KNOWN_FUNNEL_IPS.length];
-    if (options.all) {
-      return callback(null, KNOWN_FUNNEL_IPS.map((addr) => ({ address: addr, family: 4 })));
-    }
-    return callback(null, ip, 4);
-  }
-  return _realDnsLookup(hostname, options, callback);
-};
-
-const TLS_COMBOS = [
-  { label: "TLS1.3-only, ALPN h1", minVersion: "TLSv1.3", maxVersion: "TLSv1.3", ALPNProtocols: ["http/1.1"] },
-  { label: "TLS1.2-only, ALPN h1", minVersion: "TLSv1.2", maxVersion: "TLSv1.2", ALPNProtocols: ["http/1.1"] },
-  { label: "TLS1.2-1.3, ALPN h1",  minVersion: "TLSv1.2", maxVersion: "TLSv1.3", ALPNProtocols: ["http/1.1"] },
-  { label: "TLS1.2-only, no ALPN", minVersion: "TLSv1.2", maxVersion: "TLSv1.2", ALPNProtocols: undefined },
-  { label: "TLS1.3-only, no ALPN", minVersion: "TLSv1.3", maxVersion: "TLSv1.3", ALPNProtocols: undefined },
-  { label: "default negotiation",  minVersion: undefined, maxVersion: undefined, ALPNProtocols: undefined },
-];
-
-let bestConnection   = null; // { ip, combo } once a working one is found
-let probeInProgress  = false;
-
-function probeOnce(ip, combo, cb) {
-  let done = false;
-  const socket = tls.connect({
-    host: ip,
-    port: 443,
-    servername: TUNNEL_HOSTNAME, // SNI preserved — cert still validates normally
-    minVersion: combo.minVersion,
-    maxVersion: combo.maxVersion,
-    ALPNProtocols: combo.ALPNProtocols,
-    timeout: 6000,
-  });
-  const finish = (ok, err) => {
-    if (done) return;
-    done = true;
-    try { socket.destroy(); } catch {}
-    cb(ok, err);
-  };
-  socket.once("secureConnect", () => {
-    socket.write(`GET / HTTP/1.1\r\nHost: ${TUNNEL_HOSTNAME}\r\nConnection: close\r\n\r\n`);
-    let body = "";
-    socket.on("data", (chunk) => { body += chunk.toString(); });
-    socket.on("end", () => finish(body.length > 0, null));
-  });
-  socket.once("timeout", () => finish(false, "TIMEOUT"));
-  socket.once("error",   (err) => finish(false, err.code || err.message));
-}
-
-function probeAllCombinations(onComplete) {
-  if (probeInProgress) return;
-  probeInProgress = true;
-
-  const attempts = [];
-  for (const ip of KNOWN_FUNNEL_IPS) for (const combo of TLS_COMBOS) attempts.push({ ip, combo });
-
-  let i = 0;
-  function next() {
-    if (i >= attempts.length) {
-      probeInProgress = false;
-      console.error("[relay] ALL connection combinations failed.");
-      onComplete(null);
-      return;
-    }
-    const { ip, combo } = attempts[i++];
-    probeOnce(ip, combo, (ok, err) => {
-      if (ok) {
-        console.log(`[relay] WORKING combination found: ip=${ip} tls="${combo.label}"`);
-        bestConnection = { ip, combo };
-        probeInProgress = false;
-        onComplete(bestConnection);
-        return;
-      }
-      console.warn(`[relay] failed: ip=${ip} tls="${combo.label}" error=${err}`);
-      next();
-    });
-  }
-  next();
-}
-
-probeAllCombinations(() => {}); // run once at boot; re-runs automatically on live failure
-
-class AdaptiveHttpsAgent extends https.Agent {
-  createConnection(options, callback) {
-    const chosen = bestConnection || { ip: KNOWN_FUNNEL_IPS[0], combo: TLS_COMBOS[0] };
-    const socket = tls.connect({
-      ...options,
-      host: chosen.ip,
-      servername: TUNNEL_HOSTNAME,
-      minVersion: chosen.combo.minVersion,
-      maxVersion: chosen.combo.maxVersion,
-      ALPNProtocols: chosen.combo.ALPNProtocols,
-    });
-    socket.once("error", () => { if (!probeInProgress) probeAllCombinations(() => {}); });
-    if (callback) socket.once("secureConnect", () => callback(null, socket));
-    return socket;
-  }
-}
-const adaptiveAgent = new AdaptiveHttpsAgent({ keepAlive: true, maxSockets: 20 });
 
 const PORT           = process.env.PORT || 10000;
 const RELAY_SECRET   = process.env.RELAY_SECRET;
@@ -218,82 +63,6 @@ app.use((req, res, next) => {
   setCors(req, res);
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
-});
-
-// ---------------------------------------------------------------------------
-// [DEBUG] Diagnostic endpoint — no shell access on Render's free tier, so
-// this lets us see EXACTLY what Node/Render's network sees when it tries to
-// resolve and reach the tunnel host, without guessing from outside anymore.
-//
-// GET /debug-connectivity
-// Returns: DNS lookup result (or the exact error code), plus the result of
-// an actual HTTPS request to the tunnel's health check route ("/").
-//
-// This is deliberately unauthenticated read-only diagnostic info (hostname/IP
-// only, no secrets) so it's safe to hit directly from a browser while
-// debugging. Remove or protect behind RELAY_SECRET once the issue is found.
-// ---------------------------------------------------------------------------
-app.get("/debug-connectivity", (req, res) => {
-  const target = new URL(tunnelUrl);
-  const report = {
-    tunnelUrl,
-    hostname: target.hostname,
-    nodeVersion: process.version,
-    timestamp: new Date().toISOString(),
-    dnsLookup: null,
-    dnsResolve4: null,
-    dnsResolve6: null,
-    httpsRequest: null,
-  };
-
-  const finish = () => res.json(report);
-
-  // Step 1: dns.lookup (uses OS resolver — this is what most Node HTTP
-  // clients use internally, including what http-proxy-middleware relies on).
-  dns.lookup(target.hostname, { all: true }, (err, addresses) => {
-    report.dnsLookup = err
-      ? { error: err.code || err.message }
-      : { addresses };
-
-    // Step 2: dns.resolve4 (uses the DNS protocol directly, bypassing the
-    // OS's /etc/hosts and other resolver quirks — narrows down whether this
-    // is an OS-level resolver issue vs a network-level block).
-    dns.resolve4(target.hostname, (err4, addrs4) => {
-      report.dnsResolve4 = err4 ? { error: err4.code || err4.message } : { addresses: addrs4 };
-
-      dns.resolve6(target.hostname, (err6, addrs6) => {
-        report.dnsResolve6 = err6 ? { error: err6.code || err6.message } : { addresses: addrs6 };
-
-        // Step 3: actual HTTPS request to the tunnel's health check.
-        const healthUrl = new URL("/", tunnelUrl);
-        const startedAt = Date.now();
-        const request = https.get(healthUrl, { timeout: 8000 }, (upstreamRes) => {
-          let body = "";
-          upstreamRes.on("data", (chunk) => { body += chunk; });
-          upstreamRes.on("end", () => {
-            report.httpsRequest = {
-              statusCode: upstreamRes.statusCode,
-              bodySnippet: body.slice(0, 200),
-              tookMs: Date.now() - startedAt,
-            };
-            finish();
-          });
-        });
-        request.on("timeout", () => {
-          request.destroy();
-          report.httpsRequest = { error: "TIMEOUT", tookMs: Date.now() - startedAt };
-          finish();
-        });
-        request.on("error", (err) => {
-          report.httpsRequest = {
-            error: err.code || err.message,
-            tookMs: Date.now() - startedAt,
-          };
-          finish();
-        });
-      });
-    });
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -355,8 +124,6 @@ app.get("/api/stream", requireTunnel, (req, res) => {
       path:     target.pathname + target.search,
       method:   "GET",
       headers:  proxyHeaders,
-      family:   4,
-      agent:    target.protocol === "https:" ? adaptiveAgent : undefined, // [FIX] use the working TLS/IP combo
     },
     (proxyRes) => {
       if (proxyRes.statusCode < 200 || proxyRes.statusCode >= 300) {
@@ -425,7 +192,6 @@ app.use("/", requireTunnel, createProxyMiddleware({
   changeOrigin: true,
   ws:           false,
   logLevel:     "warn",
-  agent:        adaptiveAgent, // [FIX] route through the working TLS/IP combo, not default negotiation
   onProxyRes: (proxyRes) => {
     delete proxyRes.headers["access-control-allow-origin"];
     delete proxyRes.headers["access-control-allow-methods"];
@@ -433,8 +199,7 @@ app.use("/", requireTunnel, createProxyMiddleware({
     delete proxyRes.headers["vary"];
   },
   onError: (err, req, res) => {
-    console.error("[relay] proxy error:", err.code || err.message, "— current best connection:", bestConnection);
-    if (!probeInProgress) probeAllCombinations(() => {});
+    console.error("[relay] proxy error:", err.message);
     if (!res.headersSent) res.status(502).json({ error: "VAIO bağlantısı başarısız" });
   },
 }));
@@ -448,6 +213,22 @@ const httpServer = app.listen(PORT, () =>
 
 // ---------------------------------------------------------------------------
 // WebSocket bridge (/api/client-stream)
+//
+// http-proxy-middleware cannot proxy WebSocket upgrades in this config
+// (ws: false, and Render's infra strips the Upgrade header anyway).
+// We bridge manually: accept the upgrade from the browser, open a WS to the
+// VAIO tunnel, and pipe frames both ways.
+//
+// KEY DESIGN POINT — buffering client messages before upstream opens:
+//   handleUpgrade() completes the browser-side handshake synchronously,
+//   which fires ws.onopen on the ClientStream immediately. The client sends
+//   its I-FRAME auth message right then. But the upstream WS connection to
+//   the VAIO is still being established (async TCP + TLS handshake). If we
+//   only wire up clientWs.on('message') inside upstream.on('open'), that
+//   I-FRAME arrives in the gap and is silently dropped — the VAIO never sees
+//   it, never sends I-FRAME-ACK, and the auth timeout fires 8 s later.
+//   Fix: buffer all client messages received before the upstream opens, then
+//   flush them in order the moment the upstream connection is ready.
 // ---------------------------------------------------------------------------
 const wssRelay = new WebSocketServer({ noServer: true });
 
@@ -479,22 +260,28 @@ httpServer.on("upgrade", (req, socket, head) => {
   });
 
   wssRelay.handleUpgrade(req, socket, head, (clientWs) => {
+    // Buffer for messages that arrive from the client before the upstream
+    // WS connection is open. Typically just the I-FRAME auth message.
     const clientQueue = [];
 
+    // Wire up the client message handler immediately so no messages are missed.
     clientWs.on("message", (data, isBinary) => {
       if (upstream.readyState === WsClient.OPEN) {
         upstream.send(data, { binary: isBinary });
       } else {
+        // Upstream still connecting — queue for ordered flush on open.
         clientQueue.push({ data, isBinary });
       }
     });
 
     upstream.on("open", () => {
+      // Flush any messages that arrived before the upstream was ready.
       for (const { data, isBinary } of clientQueue) {
         upstream.send(data, { binary: isBinary });
       }
       clientQueue.length = 0;
 
+      // Now wire up the upstream→client direction.
       upstream.on("message", (data, isBinary) => {
         if (clientWs.readyState === WsClient.OPEN) {
           clientWs.send(data, { binary: isBinary });
@@ -502,6 +289,7 @@ httpServer.on("upgrade", (req, socket, head) => {
       });
     });
 
+    // ── teardown helpers ──────────────────────────────────────────────────
     function closeUpstream(code, reason) {
       if (upstream.readyState < WsClient.CLOSING) upstream.close(code, reason);
     }
@@ -520,5 +308,9 @@ httpServer.on("upgrade", (req, socket, head) => {
       console.error("[relay] WS upstream error:", err.message);
       closeClient(1011, "Upstream error");
     });
+
+    // If the upstream never opens (e.g. VAIO is down), close the client cleanly.
+    // This is handled by upstream.on('error') above — the 'error' event fires
+    // before 'close' when the connection is refused, so closeClient() runs there.
   });
 });
