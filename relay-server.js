@@ -1,13 +1,3 @@
-// ============================================================================
-// SOPERT RELAY — Render
-// Chain: Frontend → Render (this) → ngrok → VAIO :3000
-//
-// Env vars to set in Render dashboard:
-//   TUNNEL_URL     = https://latticed-hunting-causing.ngrok-free.dev
-//   RELAY_SECRET   = (your secret)
-//   ALLOWED_ORIGIN = https://totallyrandom001.github.io
-// ============================================================================
-
 const express    = require("express");
 const rateLimit  = require("express-rate-limit");
 const { createProxyMiddleware } = require("http-proxy-middleware");
@@ -54,7 +44,7 @@ app.use((req, res, next) => {
 
 // ── Health / status ──────────────────────────────────────────────────────────
 app.get("/relay-status", (_req, res) =>
-  res.json({ ok: true, tunnel: TUNNEL_URL })
+  res.json({ ok: true })
 );
 
 // ── Rate limit ───────────────────────────────────────────────────────────────
@@ -72,7 +62,7 @@ const proxy = createProxyMiddleware({
     error: (err, req, res) => {
       console.error("[relay] proxy error:", err.message);
       if (res && !res.headersSent)
-        res.status(502).json({ error: "Tunnel unreachable — is VAIO running?" });
+        res.status(999).json({ error: "Upstream unreachable." });
     },
   },
 });
@@ -82,7 +72,7 @@ app.use("/", proxy);
 // ── Start server ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 10000;
 const server = app.listen(PORT, () =>
-  console.log(`[relay] Listening on :${PORT} → ${TUNNEL_URL}`)
+  console.log(`[relay] Listening on :${PORT}`)
 );
 
 // WebSocket upgrades MUST be wired here — middleware alone doesn't catch them
