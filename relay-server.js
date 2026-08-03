@@ -65,6 +65,9 @@ const proxy = createProxyMiddleware({
   target: TUNNEL_URL,
   changeOrigin: true,
   ws: true,                     // enable WebSocket proxying
+  headers: {
+    "ngrok-skip-browser-warning": "true",  // bypass ngrok interstitial page
+  },
   on: {
     error: (err, req, res) => {
       console.error("[relay] proxy error:", err.message);
