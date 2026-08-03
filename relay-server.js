@@ -1,48 +1,162 @@
 // ============================================================================
 // SOPERT RELAY — deployed on Render.
-// Browser (GitHub Pages) -> this relay -> the VAIO's Tailscale Funnel hostname
-// (fixed, doesn't rotate) -> VAIO's local server.
-//
-// Env vars required on Render:
-//   TUNNEL_URL        your Tailscale Funnel hostname, e.g.
-//                      https://your-machine.your-tailnet.ts.net
-//   RELAY_SECRET      shared secret, still used to auth the optional manual
-//                      /register-tunnel override below (kept for convenience
-//                      if you ever need to point at a different URL without
-//                      redeploying, but TUNNEL_URL is the normal source of truth)
-//   ALLOWED_ORIGIN    (optional) defaults to https://totallyrandom001.github.io
 // ============================================================================
 
 const express   = require("express");
 const https     = require("https");
 const http      = require("http");
+const tls       = require("tls");
+const net       = require("net");
+const dns       = require("dns");
 const rateLimit = require("express-rate-limit");
 const { createProxyMiddleware }      = require("http-proxy-middleware");
-const { WebSocketServer, WebSocket: WsClient } = require("ws");   // npm install ws
+const { WebSocketServer, WebSocket: WsClient } = require("ws");
+
+// Force IPv4 first to bypass Render's lack of IPv6 egress routes
+if (typeof dns.setDefaultResultOrder === "function") {
+  dns.setDefaultResultOrder("ipv4first");
+  console.log("[relay] DNS result order forced to ipv4first");
+}
+
+if (!process.env.RELAY_SECRET || !process.env.TUNNEL_URL) {
+  console.error("FATAL: RELAY_SECRET and TUNNEL_URL env vars must be set on Render.");
+  process.exit(1);
+}
+
+let tunnelUrl = process.env.TUNNEL_URL.replace(/\/$/, "");
+const TUNNEL_HOSTNAME = new URL(tunnelUrl).hostname;
+console.log("[relay] Using fixed tunnel ->", tunnelUrl);
+
+// Base known IPs + dynamic discovery pool
+const KNOWN_FUNNEL_IPS = ["176.58.88.108", "176.58.88.82", "176.58.92.199"];
+let currentProbeIps = [...KNOWN_FUNNEL_IPS];
+
+const TLS_COMBOS = [
+  { label: "TLS1.3-only, ALPN h1", minVersion: "TLSv1.3", maxVersion: "TLSv1.3", ALPNProtocols: ["http/1.1"] },
+  { label: "TLS1.2-only, ALPN h1", minVersion: "TLSv1.2", maxVersion: "TLSv1.2", ALPNProtocols: ["http/1.1"] },
+  { label: "TLS1.2-1.3, ALPN h1",  minVersion: "TLSv1.2", maxVersion: "TLSv1.3", ALPNProtocols: ["http/1.1"] },
+  { label: "TLS1.2-only, no ALPN", minVersion: "TLSv1.2", maxVersion: "TLSv1.2", ALPNProtocols: undefined },
+  { label: "TLS1.3-only, no ALPN", minVersion: "TLSv1.3", maxVersion: "TLSv1.3", ALPNProtocols: undefined },
+  { label: "default negotiation",  minVersion: undefined, maxVersion: undefined, ALPNProtocols: undefined },
+];
+
+let bestConnection  = null;
+let probeInProgress = false;
+
+// DNS Patch to enforce our discovered/working IP globally across the Node process
+const _realDnsLookup = dns.lookup.bind(dns);
+dns.lookup = function patchedLookup(hostname, options, callback) {
+  if (typeof options === "function") { callback = options; options = {}; }
+  options = options || {};
+
+  if (hostname === TUNNEL_HOSTNAME && bestConnection) {
+    if (options.all) return callback(null, [{ address: bestConnection.ip, family: 4 }]);
+    return callback(null, bestConnection.ip, 4);
+  }
+  return _realDnsLookup(hostname, options, callback);
+};
+
+function probeOnce(ip, combo, cb) {
+  let done = false;
+  const socket = tls.connect({
+    host: ip,
+    port: 443,
+    servername: TUNNEL_HOSTNAME,
+    minVersion: combo.minVersion,
+    maxVersion: combo.maxVersion,
+    ALPNProtocols: combo.ALPNProtocols,
+    timeout: 6000,
+  });
+
+  const finish = (ok, err) => {
+    if (done) return;
+    done = true;
+    try { socket.destroy(); } catch {}
+    cb(ok, err);
+  };
+
+  socket.once("secureConnect", () => {
+    socket.write(`GET / HTTP/1.1\r\nHost: ${TUNNEL_HOSTNAME}\r\nConnection: close\r\n\r\n`);
+    let body = "";
+    socket.on("data", (chunk) => { body += chunk.toString(); });
+    socket.on("end", () => finish(body.length > 0, null));
+  });
+
+  socket.once("timeout", () => finish(false, "TIMEOUT"));
+  socket.once("error",   (err) => finish(false, err.code || err.message));
+}
+
+function executeProbes(onComplete) {
+  const attempts = [];
+  for (const ip of currentProbeIps) {
+    for (const combo of TLS_COMBOS) attempts.push({ ip, combo });
+  }
+
+  let i = 0;
+  function next() {
+    if (i >= attempts.length) {
+      probeInProgress = false;
+      console.error("[relay] ALL connection combinations failed.");
+      return onComplete(null);
+    }
+    const { ip, combo } = attempts[i++];
+    probeOnce(ip, combo, (ok, err) => {
+      if (ok) {
+        console.log(`[relay] WORKING combination found: ip=${ip} tls="${combo.label}"`);
+        bestConnection = { ip, combo };
+        probeInProgress = false;
+        return onComplete(bestConnection);
+      }
+      next();
+    });
+  }
+  next();
+}
+
+function probeAllCombinations(onComplete) {
+  if (probeInProgress) return;
+  probeInProgress = true;
+
+  // [FIX] Dynamically fetch Tailscale's CURRENT IPs to prevent hardcoded IPs from rotting
+  dns.resolve4(TUNNEL_HOSTNAME, (err, addrs) => {
+    if (!err && addrs && addrs.length > 0) {
+      const uniqueIps = new Set([...addrs, ...KNOWN_FUNNEL_IPS]);
+      currentProbeIps = Array.from(uniqueIps);
+      console.log(`[relay] Target IP pool updated via DNS: ${currentProbeIps.join(", ")}`);
+    } else {
+      console.warn(`[relay] DNS resolve4 failed, falling back to hardcoded IPs.`);
+    }
+    executeProbes(onComplete);
+  });
+}
+
+probeAllCombinations(() => {});
+
+class AdaptiveHttpsAgent extends https.Agent {
+  createConnection(options, callback) {
+    const chosen = bestConnection || { ip: currentProbeIps[0], combo: TLS_COMBOS[0] };
+    const socket = tls.connect({
+      ...options,
+      host: chosen.ip,
+      servername: TUNNEL_HOSTNAME,
+      minVersion: chosen.combo.minVersion,
+      maxVersion: chosen.combo.maxVersion,
+      ALPNProtocols: chosen.combo.ALPNProtocols,
+    });
+    socket.once("error", () => { if (!probeInProgress) probeAllCombinations(() => {}); });
+    if (callback) socket.once("secureConnect", () => callback(null, socket));
+    return socket;
+  }
+}
+const adaptiveAgent = new AdaptiveHttpsAgent({ keepAlive: true, maxSockets: 20 });
 
 const PORT           = process.env.PORT || 10000;
 const RELAY_SECRET   = process.env.RELAY_SECRET;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "https://totallyrandom001.github.io";
 
-if (!RELAY_SECRET) {
-  console.error("FATAL: RELAY_SECRET env var must be set on Render.");
-  process.exit(1);
-}
-if (!process.env.TUNNEL_URL) {
-  console.error("FATAL: TUNNEL_URL env var must be set on Render (your Tailscale Funnel hostname).");
-  process.exit(1);
-}
-
-let tunnelUrl = process.env.TUNNEL_URL.replace(/\/$/, "");
-console.log("[relay] using fixed tunnel ->", tunnelUrl);
-
 const app = express();
 app.set("trust proxy", 1);
 
-// ---------------------------------------------------------------------------
-// CORS — set on every response (including errors) so the browser always
-// gets a readable response instead of an opaque CORS failure.
-// ---------------------------------------------------------------------------
 const ALLOWED_ORIGINS = new Set([
   ALLOWED_ORIGIN,
   "http://localhost:3000",
@@ -65,9 +179,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------------------------------------------------------------------------
-// Manual tunnel override (optional) — hot-swap without a Render redeploy.
-// ---------------------------------------------------------------------------
+// Manual tunnel override
 app.post("/register-tunnel", express.json(), (req, res) => {
   const { url, secret } = req.body || {};
   if (secret !== RELAY_SECRET) return res.status(403).json({ error: "bad secret" });
@@ -79,15 +191,9 @@ app.post("/register-tunnel", express.json(), (req, res) => {
   res.json({ ok: true });
 });
 
-app.get("/relay-status", (req, res) => {
-  res.json({ connected: true, tunnelUrl });
-});
+app.get("/relay-status", (req, res) => res.json({ connected: true, tunnelUrl }));
 
-// ---------------------------------------------------------------------------
-// Rate limit everything below this point.
-// Note: WebSocket upgrades bypass Express middleware entirely (they go through
-// httpServer's 'upgrade' event) so this only covers HTTP routes.
-// ---------------------------------------------------------------------------
+// Rate limiter for standard HTTP endpoints
 app.use(rateLimit({
   windowMs: 60 * 1000,
   max:      120,
@@ -102,11 +208,7 @@ function requireTunnel(req, res, next) {
 }
 
 // ---------------------------------------------------------------------------
-// SSE route — proxied manually so we can flush every chunk immediately.
-//
-// http-proxy-middleware buffers response bodies before forwarding them.
-// For SSE this is fatal: frames accumulate in the proxy's buffer, the browser
-// never receives them, and Render's LB sees an idle connection and kills it.
+// SSE Route
 // ---------------------------------------------------------------------------
 app.get("/api/stream", requireTunnel, (req, res) => {
   const target = new URL("/api/stream", tunnelUrl);
@@ -115,8 +217,6 @@ app.get("/api/stream", requireTunnel, (req, res) => {
   const transport = target.protocol === "https:" ? https : http;
   const proxyHeaders = { ...req.headers, host: target.hostname };
 
-  console.log(`[relay] SSE proxy → ${target.href}`);
-
   const proxyReq = transport.request(
     {
       hostname: target.hostname,
@@ -124,14 +224,14 @@ app.get("/api/stream", requireTunnel, (req, res) => {
       path:     target.pathname + target.search,
       method:   "GET",
       headers:  proxyHeaders,
+      family:   4,
+      agent:    target.protocol === "https:" ? adaptiveAgent : undefined,
     },
     (proxyRes) => {
       if (proxyRes.statusCode < 200 || proxyRes.statusCode >= 300) {
-        console.error(`[relay] SSE upstream returned non-2xx: ${proxyRes.statusCode}`);
         proxyRes.resume();
         setCors(req, res);
-        res.status(502).json({ error: "VAIO tüneli şu anda ulaşılamıyor" });
-        return;
+        return res.status(502).json({ error: "VAIO tüneli şu anda ulaşılamıyor" });
       }
 
       const headers = { ...proxyRes.headers };
@@ -163,7 +263,7 @@ app.get("/api/stream", requireTunnel, (req, res) => {
         console.error("[relay] SSE upstream error:", e.message);
         if (!res.writableEnded) res.end();
       });
-    },
+    }
   );
 
   proxyReq.on("error", (e) => {
@@ -176,22 +276,19 @@ app.get("/api/stream", requireTunnel, (req, res) => {
     }
   });
 
-  req.on("close", () => {
-    console.log("[relay] SSE browser disconnected — aborting upstream");
-    proxyReq.destroy();
-  });
-
+  req.on("close", () => proxyReq.destroy());
   proxyReq.end();
 });
 
 // ---------------------------------------------------------------------------
-// Proxy everything else to the tunnel (non-SSE HTTP routes).
+// Proxy General Routes
 // ---------------------------------------------------------------------------
 app.use("/", requireTunnel, createProxyMiddleware({
   router:      () => tunnelUrl,
   changeOrigin: true,
-  ws:           false,
+  ws:           false, // We handle WS manually below
   logLevel:     "warn",
+  agent:        adaptiveAgent,
   onProxyRes: (proxyRes) => {
     delete proxyRes.headers["access-control-allow-origin"];
     delete proxyRes.headers["access-control-allow-methods"];
@@ -199,89 +296,62 @@ app.use("/", requireTunnel, createProxyMiddleware({
     delete proxyRes.headers["vary"];
   },
   onError: (err, req, res) => {
-    console.error("[relay] proxy error:", err.message);
+    console.error("[relay] proxy error:", err.code || err.message);
+    if (!probeInProgress) probeAllCombinations(() => {});
     if (!res.headersSent) res.status(502).json({ error: "VAIO bağlantısı başarısız" });
   },
 }));
 
-// ---------------------------------------------------------------------------
-// Boot
-// ---------------------------------------------------------------------------
-const httpServer = app.listen(PORT, () =>
-  console.log(`[relay] listening on :${PORT}`)
-);
+// Boot HTTP
+const httpServer = app.listen(PORT, () => console.log(`[relay] listening on :${PORT}`));
 
 // ---------------------------------------------------------------------------
-// WebSocket bridge (/api/client-stream)
-//
-// http-proxy-middleware cannot proxy WebSocket upgrades in this config
-// (ws: false, and Render's infra strips the Upgrade header anyway).
-// We bridge manually: accept the upgrade from the browser, open a WS to the
-// VAIO tunnel, and pipe frames both ways.
-//
-// KEY DESIGN POINT — buffering client messages before upstream opens:
-//   handleUpgrade() completes the browser-side handshake synchronously,
-//   which fires ws.onopen on the ClientStream immediately. The client sends
-//   its I-FRAME auth message right then. But the upstream WS connection to
-//   the VAIO is still being established (async TCP + TLS handshake). If we
-//   only wire up clientWs.on('message') inside upstream.on('open'), that
-//   I-FRAME arrives in the gap and is silently dropped — the VAIO never sees
-//   it, never sends I-FRAME-ACK, and the auth timeout fires 8 s later.
-//   Fix: buffer all client messages received before the upstream opens, then
-//   flush them in order the moment the upstream connection is ready.
+// WebSocket Bridge [FIXED: Added Adaptive Agent]
 // ---------------------------------------------------------------------------
 const wssRelay = new WebSocketServer({ noServer: true });
 
 httpServer.on("upgrade", (req, socket, head) => {
   if (!req.url?.startsWith("/api/client-stream")) {
     socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
-    socket.destroy();
-    return;
+    return socket.destroy();
   }
 
   const origin = req.headers.origin;
   if (!ALLOWED_ORIGINS.has(origin)) {
     socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
-    socket.destroy();
-    return;
+    return socket.destroy();
   }
 
   if (!tunnelUrl) {
     socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
-    socket.destroy();
-    return;
+    return socket.destroy();
   }
 
   const vaioWsUrl = tunnelUrl.replace(/^http/, "ws") + req.url;
-  console.log(`[relay] WS bridge → ${vaioWsUrl}`);
-
+  
+  // [FIX] Apply the exact same adaptive TLS agent to WebSockets to bypass the Render drop
   const upstream = new WsClient(vaioWsUrl, {
     headers: { ...req.headers, host: new URL(tunnelUrl).hostname },
+    agent: vaioWsUrl.startsWith("wss:") ? adaptiveAgent : undefined,
   });
 
   wssRelay.handleUpgrade(req, socket, head, (clientWs) => {
-    // Buffer for messages that arrive from the client before the upstream
-    // WS connection is open. Typically just the I-FRAME auth message.
     const clientQueue = [];
 
-    // Wire up the client message handler immediately so no messages are missed.
     clientWs.on("message", (data, isBinary) => {
       if (upstream.readyState === WsClient.OPEN) {
         upstream.send(data, { binary: isBinary });
       } else {
-        // Upstream still connecting — queue for ordered flush on open.
         clientQueue.push({ data, isBinary });
       }
     });
 
     upstream.on("open", () => {
-      // Flush any messages that arrived before the upstream was ready.
       for (const { data, isBinary } of clientQueue) {
         upstream.send(data, { binary: isBinary });
       }
       clientQueue.length = 0;
 
-      // Now wire up the upstream→client direction.
       upstream.on("message", (data, isBinary) => {
         if (clientWs.readyState === WsClient.OPEN) {
           clientWs.send(data, { binary: isBinary });
@@ -289,7 +359,6 @@ httpServer.on("upgrade", (req, socket, head) => {
       });
     });
 
-    // ── teardown helpers ──────────────────────────────────────────────────
     function closeUpstream(code, reason) {
       if (upstream.readyState < WsClient.CLOSING) upstream.close(code, reason);
     }
@@ -304,13 +373,11 @@ httpServer.on("upgrade", (req, socket, head) => {
       console.error("[relay] WS client error:", err.message);
       closeUpstream(1011, "Client error");
     });
+    
     upstream.on("error", (err) => {
       console.error("[relay] WS upstream error:", err.message);
       closeClient(1011, "Upstream error");
+      if (!probeInProgress) probeAllCombinations(() => {});
     });
-
-    // If the upstream never opens (e.g. VAIO is down), close the client cleanly.
-    // This is handled by upstream.on('error') above — the 'error' event fires
-    // before 'close' when the connection is refused, so closeClient() runs there.
   });
 });
