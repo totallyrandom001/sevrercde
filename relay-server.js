@@ -21,6 +21,26 @@ const rateLimit = require("express-rate-limit");
 const { createProxyMiddleware }      = require("http-proxy-middleware");
 const { WebSocketServer, WebSocket: WsClient } = require("ws");   // npm install ws
 
+// ============================================================================
+// [FIX] ENETUNREACH root cause: the tunnel hostname resolves to both IPv4 and
+// IPv6 addresses, and Render's outbound network does not route IPv6 traffic.
+// Node's default DNS behavior can return/prefer the IPv6 address first, so
+// http-proxy-middleware (and any raw https.request) ends up trying to dial
+// an address with literally no outbound route -> ENETUNREACH.
+//
+// Forcing ipv4first here makes dns.lookup() -- which is what Node's http/https
+// modules use internally to resolve a hostname before connecting -- always
+// return IPv4 addresses ahead of IPv6 ones, so every outbound connection
+// (the manual SSE request, the WS bridge, and http-proxy-middleware's
+// internal requests) picks an address Render can actually route to.
+// ============================================================================
+if (typeof dns.setDefaultResultOrder === "function") {
+  dns.setDefaultResultOrder("ipv4first");
+  console.log("[relay] DNS result order forced to ipv4first (fix for ENETUNREACH on IPv6-less egress)");
+} else {
+  console.warn("[relay] dns.setDefaultResultOrder unavailable on this Node version — IPv6 ENETUNREACH risk remains");
+}
+
 const PORT           = process.env.PORT || 10000;
 const RELAY_SECRET   = process.env.RELAY_SECRET;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "https://totallyrandom001.github.io";
@@ -201,6 +221,7 @@ app.get("/api/stream", requireTunnel, (req, res) => {
       path:     target.pathname + target.search,
       method:   "GET",
       headers:  proxyHeaders,
+      family:   4, // [FIX] explicit IPv4-only, in addition to the global dns.setDefaultResultOrder fix above
     },
     (proxyRes) => {
       if (proxyRes.statusCode < 200 || proxyRes.statusCode >= 300) {
