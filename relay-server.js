@@ -14,7 +14,7 @@ const { createProxyMiddleware } = require("http-proxy-middleware");
 
 const TUNNEL_URL     = (process.env.TUNNEL_URL || "").replace(/\/$/, "");
 const RELAY_SECRET   = process.env.RELAY_SECRET;
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "https://totallyrandom001.github.io";
 
 if (!RELAY_SECRET || !TUNNEL_URL) {
   console.error("FATAL: Missing TUNNEL_URL or RELAY_SECRET environment variables.");
@@ -54,19 +54,8 @@ app.use((req, res, next) => {
 
 // ── Health / status ──────────────────────────────────────────────────────────
 app.get("/relay-status", (_req, res) =>
-  res.json({ ok: true })
+  res.json({ ok: true, tunnel: TUNNEL_URL })
 );
-
-app.get("/ping", async (_req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  try {
-    const response = await fetch(TUNNEL_URL + "/ping");
-    if (response.ok) return res.status(200).json({ ok: true });
-    return res.status(999).json({ ok: false });
-  } catch {
-    return res.status(999).json({ ok: false });
-  }
-});
 
 // ── Rate limit ───────────────────────────────────────────────────────────────
 app.use(rateLimit({ windowMs: 60_000, max: 200 }));
@@ -83,7 +72,7 @@ const proxy = createProxyMiddleware({
     error: (err, req, res) => {
       console.error("[relay] proxy error:", err.message);
       if (res && !res.headersSent)
-        res.status(999).json({ error: "Upstream unreachable." });
+        res.status(502).json({ error: "Tunnel unreachable — is VAIO running?" });
     },
   },
 });
@@ -93,7 +82,7 @@ app.use("/", proxy);
 // ── Start server ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 10000;
 const server = app.listen(PORT, () =>
-  console.log(`[relay] Listening on :${PORT}`)
+  console.log(`[relay] Listening on :${PORT} → ${TUNNEL_URL}`)
 );
 
 // WebSocket upgrades MUST be wired here — middleware alone doesn't catch them
