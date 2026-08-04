@@ -4,17 +4,16 @@
 //
 // Env vars to set in Render dashboard:
 //   TUNNEL_URL     = https://latticed-hunting-causing.ngrok-free.dev
-//   RELAY_SECRET   = (your secret)
-//   ALLOWED_ORIGIN = https://totallyrandom001.github.io
+//   RELAY_SECRET   = g7as078sa0hga0af0w78s07gb0nns8907fgdga8a08gf90ag09
+//   ALLOWED_ORIGIN = https://totallyrandom001.github.io  (unused now, kept for reference)
 // ============================================================================
 
 const express   = require("express");
 const rateLimit = require("express-rate-limit");
 const { createProxyMiddleware } = require("http-proxy-middleware");
 
-const TUNNEL_URL     = (process.env.TUNNEL_URL || "").replace(/\/$/, "");
-const RELAY_SECRET   = process.env.RELAY_SECRET;
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "https://totallyrandom001.github.io";
+const TUNNEL_URL   = (process.env.TUNNEL_URL || "").replace(/\/$/, "");
+const RELAY_SECRET = process.env.RELAY_SECRET;
 
 if (!RELAY_SECRET || !TUNNEL_URL) {
   console.error("FATAL: Missing TUNNEL_URL or RELAY_SECRET environment variables.");
@@ -24,42 +23,18 @@ if (!RELAY_SECRET || !TUNNEL_URL) {
 const app = express();
 app.set("trust proxy", 1);
 
-const ALLOWED_ORIGINS = new Set([
-  ALLOWED_ORIGIN,
-  "http://localhost:3000",
-  "http://127.0.0.1:3000",
-]);
-
 // ── Log every incoming request ────────────────────────────────────────────────
 app.use((req, res, next) => {
   console.log(`[relay] ${req.method} ${req.path} | origin: ${req.headers.origin || "none"}`);
   next();
 });
 
-// ── CORS ──────────────────────────────────────────────────────────────────────
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  console.log(`[cors] origin: "${origin}" | known: ${ALLOWED_ORIGINS.has(origin)}`);
+// NOTE: No CORS middleware here — VAIO already sets its own CORS headers on
+// every response and they pass through the proxy untouched. Adding relay CORS
+// headers on top caused duplicate Access-Control-Allow-Origin which browsers
+// hard-reject.
 
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader("Access-Control-Allow-Credentials", "true");
-
-  if (ALLOWED_ORIGINS.has(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Vary", "Origin");
-  } else if (!origin) {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-  }
-
-  if (req.method === "OPTIONS") {
-    console.log(`[cors] preflight → 204`);
-    return res.sendStatus(204);
-  }
-  next();
-});
-
-// ── SSE: kill buffering ───────────────────────────────────────────────────────
+// ── SSE: kill buffering so events stream through immediately ──────────────────
 app.use((req, res, next) => {
   if (req.headers.accept === "text/event-stream") {
     res.setHeader("X-Accel-Buffering", "no");
@@ -83,9 +58,8 @@ const proxy = createProxyMiddleware({
   changeOrigin: true,
   ws: true,
   headers: {
-    "ngrok-skip-browser-warning": "true",
-    // Forward secret so VAIO accepts the request
-    "x-relay-secret": RELAY_SECRET,
+    "ngrok-skip-browser-warning": "true",   // skip ngrok interstitial
+    "x-relay-secret": RELAY_SECRET,         // VAIO auth check
   },
   on: {
     proxyReq: (proxyReq, req) => {
@@ -94,7 +68,7 @@ const proxy = createProxyMiddleware({
     proxyRes: (proxyRes, req) => {
       console.log(`[proxy] ← ${proxyRes.statusCode} ${req.path}`);
       if (proxyRes.statusCode === 403)
-        console.error(`[proxy] 403 from VAIO — check VAIO auth middleware expects x-relay-secret header`);
+        console.error(`[proxy] 403 from VAIO — is x-relay-secret correct?`);
     },
     error: (err, req, res) => {
       console.error(`[proxy] error on ${req.path}:`, err.message);
