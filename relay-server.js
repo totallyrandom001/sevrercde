@@ -14,7 +14,7 @@ const { createProxyMiddleware } = require("http-proxy-middleware");
 
 const TUNNEL_URL     = (process.env.TUNNEL_URL || "").replace(/\/$/, "");
 const RELAY_SECRET   = process.env.RELAY_SECRET;
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "https://totallyrandom001.github.io";
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 
 if (!RELAY_SECRET || !TUNNEL_URL) {
   console.error("FATAL: Missing TUNNEL_URL or RELAY_SECRET environment variables.");
