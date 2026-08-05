@@ -11,6 +11,7 @@ const express   = require("express");
 const https     = require("https");
 const http      = require("http");
 const rateLimit = require("express-rate-limit");
+const cors      = require("cors"); // Added CORS package
 const { createProxyMiddleware } = require("http-proxy-middleware");
 
 const TUNNEL_URL   = (process.env.TUNNEL_URL || "").replace(/\/$/, "");
@@ -24,14 +25,18 @@ if (!RELAY_SECRET || !TUNNEL_URL) {
 const app = express();
 app.set("trust proxy", 1);
 
+// ── CORS: Allow all origins ───────────────────────────────────────────────────
+app.use(cors({
+  origin: "*", // Allows all origins
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["*"]
+}));
+
 // ── Log every incoming request ────────────────────────────────────────────────
 app.use((req, res, next) => {
   console.log(`[relay] ${req.method} ${req.path} | origin: ${req.headers.origin || "none"}`);
   next();
 });
-
-// NOTE: No CORS middleware here — VAIO already sets its own CORS headers on
-// every response and they pass through the proxy untouched.
 
 // ── SSE: kill buffering so events stream through immediately ──────────────────
 app.use((req, res, next) => {
