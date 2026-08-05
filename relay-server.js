@@ -123,5 +123,3 @@ const server = app.listen(PORT, () =>
 
 // ── WebSocket upgrades must be wired here ─────────────────────────────────────
 server.on("upgrade", proxy.upgrade);
-EOF
-echo "relay done"
