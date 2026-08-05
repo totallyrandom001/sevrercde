@@ -3,7 +3,7 @@
 // Chain: Frontend → Render (this) → localhost.run → VAIO :3000
 //
 // Env vars to set in Render dashboard:
-//   TUNNEL_URL     = (auto-updated by run.bat on each VAIO start)
+//   TUNNEL_URL     = (auto-updated by VAIO tunnel monitor)
 //   RELAY_SECRET   = g7as078sa0hga0af0w78s07gb0nns8907fgdga8a08gf90ag09
 // ============================================================================
 
@@ -43,10 +43,47 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── Health check ──────────────────────────────────────────────────────────────
+// ── Relay health check ────────────────────────────────────────────────────────
 app.get("/relay-status", (_req, res) =>
   res.json({ ok: true, tunnel: TUNNEL_URL })
 );
+
+// ── Ping: fast VAIO reachability check — returns 999 instantly if tunnel down ─
+app.get("/ping", (req, res) => {
+  const url = `${TUNNEL_URL}/ping`;
+  const lib = url.startsWith("https") ? https : http;
+
+  const abort = setTimeout(() => {
+    if (!res.headersSent) {
+      console.warn("[ping] VAIO unreachable — timeout");
+      res.status(999).json({ ok: false, error: "VAIO unreachable" });
+    }
+    request.destroy();
+  }, 4000);
+
+  const request = lib.get(url, {
+    headers: { "x-relay-secret": RELAY_SECRET }
+  }, (vaioRes) => {
+    clearTimeout(abort);
+    vaioRes.resume();
+    if (res.headersSent) return;
+    if (vaioRes.statusCode === 200) {
+      res.status(200).json({ ok: true });
+    } else {
+      console.warn(`[ping] VAIO returned ${vaioRes.statusCode}`);
+      res.status(999).json({ ok: false, error: "VAIO unhealthy" });
+    }
+  });
+
+  request.on("error", (e) => {
+    clearTimeout(abort);
+    if (res.headersSent) return;
+    console.warn(`[ping] VAIO connection error: ${e.message}`);
+    res.status(999).json({ ok: false, error: "VAIO unreachable" });
+  });
+
+  request.end();
+});
 
 // ── Rate limit ────────────────────────────────────────────────────────────────
 app.use(rateLimit({ windowMs: 60_000, max: 200 }));
@@ -83,20 +120,6 @@ const PORT = process.env.PORT || 10000;
 const server = app.listen(PORT, () =>
   console.log(`[relay] Listening on :${PORT} → ${TUNNEL_URL}`)
 );
-
-// ── Keepalive: ping VAIO every 4 min to keep localhost.run tunnel alive ───────
-setInterval(() => {
-  const url = `${TUNNEL_URL}/ping`;
-  const lib = url.startsWith("https") ? https : http;
-  const req = lib.get(url, {
-    headers: { "x-relay-secret": RELAY_SECRET }
-  }, (res) => {
-    console.log(`[keepalive] ping → ${res.statusCode}`);
-    res.resume();
-  });
-  req.on("error", (e) => console.warn(`[keepalive] ping failed: ${e.message}`));
-  req.end();
-}, 4 * 60 * 1000);
 
 // ── WebSocket upgrades must be wired here ─────────────────────────────────────
 server.on("upgrade", proxy.upgrade);
