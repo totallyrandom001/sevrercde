@@ -1,14 +1,15 @@
 // ============================================================================
 // SOPERT RELAY — Render
-// Chain: Frontend → Render (this) → ngrok → VAIO :3000
+// Chain: Frontend → Render (this) → localhost.run → VAIO :3000
 //
 // Env vars to set in Render dashboard:
-//   TUNNEL_URL     = https://latticed-hunting-causing.ngrok-free.dev
+//   TUNNEL_URL     = (auto-updated by run.bat on each VAIO start)
 //   RELAY_SECRET   = g7as078sa0hga0af0w78s07gb0nns8907fgdga8a08gf90ag09
-//   ALLOWED_ORIGIN = https://totallyrandom001.github.io  (unused now, kept for reference)
 // ============================================================================
 
 const express   = require("express");
+const https     = require("https");
+const http      = require("http");
 const rateLimit = require("express-rate-limit");
 const { createProxyMiddleware } = require("http-proxy-middleware");
 
@@ -30,9 +31,7 @@ app.use((req, res, next) => {
 });
 
 // NOTE: No CORS middleware here — VAIO already sets its own CORS headers on
-// every response and they pass through the proxy untouched. Adding relay CORS
-// headers on top caused duplicate Access-Control-Allow-Origin which browsers
-// hard-reject.
+// every response and they pass through the proxy untouched.
 
 // ── SSE: kill buffering so events stream through immediately ──────────────────
 app.use((req, res, next) => {
@@ -52,14 +51,13 @@ app.get("/relay-status", (_req, res) =>
 // ── Rate limit ────────────────────────────────────────────────────────────────
 app.use(rateLimit({ windowMs: 60_000, max: 200 }));
 
-// ── Proxy → ngrok → VAIO ─────────────────────────────────────────────────────
+// ── Proxy → localhost.run → VAIO ──────────────────────────────────────────────
 const proxy = createProxyMiddleware({
   target: TUNNEL_URL,
   changeOrigin: true,
   ws: true,
   headers: {
-    "ngrok-skip-browser-warning": "true",   // skip ngrok interstitial
-    "x-relay-secret": RELAY_SECRET,         // VAIO auth check
+    "x-relay-secret": RELAY_SECRET,
   },
   on: {
     proxyReq: (proxyReq, req) => {
@@ -86,5 +84,19 @@ const server = app.listen(PORT, () =>
   console.log(`[relay] Listening on :${PORT} → ${TUNNEL_URL}`)
 );
 
-// WebSocket upgrades must be wired here
+// ── Keepalive: ping VAIO every 4 min to keep localhost.run tunnel alive ───────
+setInterval(() => {
+  const url = `${TUNNEL_URL}/ping`;
+  const lib = url.startsWith("https") ? https : http;
+  const req = lib.get(url, {
+    headers: { "x-relay-secret": RELAY_SECRET }
+  }, (res) => {
+    console.log(`[keepalive] ping → ${res.statusCode}`);
+    res.resume();
+  });
+  req.on("error", (e) => console.warn(`[keepalive] ping failed: ${e.message}`));
+  req.end();
+}, 4 * 60 * 1000);
+
+// ── WebSocket upgrades must be wired here ─────────────────────────────────────
 server.on("upgrade", proxy.upgrade);
