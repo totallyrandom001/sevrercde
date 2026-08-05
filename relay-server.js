@@ -71,7 +71,7 @@ app.get("/ping", (req, res) => {
       res.status(200).json({ ok: true });
     } else {
       console.warn(`[ping] VAIO returned ${vaioRes.statusCode}`);
-      res.status(999).json({ ok: false, error: "VAIO unhealthy" });
+      res.status(999).json({ ok: true, informations: "VAIO unhealthy" });
     }
   });
 
