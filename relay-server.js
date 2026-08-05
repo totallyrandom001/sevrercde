@@ -3,7 +3,7 @@
 // Chain: Frontend → Render (this) → localhost.run → VAIO :3000
 //
 // Env vars to set in Render dashboard:
-//   TUNNEL_URL     = (auto-updated by VAIO tunnel monitor)
+//   TUNNEL_URL     = (auto-updated by VAIO tunnel monitor on each start)
 //   RELAY_SECRET   = g7as078sa0hga0af0w78s07gb0nns8907fgdga8a08gf90ag09
 // ============================================================================
 
@@ -43,12 +43,12 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── Relay health check ────────────────────────────────────────────────────────
+// ── Health / status ───────────────────────────────────────────────────────────
 app.get("/relay-status", (_req, res) =>
   res.json({ ok: true, tunnel: TUNNEL_URL })
 );
 
-// ── Ping: fast VAIO reachability check — returns 999 instantly if tunnel down ─
+// ── Ping: fast VAIO reachability check, returns 999 instantly if tunnel down ──
 app.get("/ping", (req, res) => {
   const url = `${TUNNEL_URL}/ping`;
   const lib = url.startsWith("https") ? https : http;
@@ -123,3 +123,5 @@ const server = app.listen(PORT, () =>
 
 // ── WebSocket upgrades must be wired here ─────────────────────────────────────
 server.on("upgrade", proxy.upgrade);
+EOF
+echo "relay done"
