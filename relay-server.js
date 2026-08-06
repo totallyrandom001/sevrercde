@@ -103,7 +103,9 @@ const proxy = createProxyMiddleware({
   },
   on: {
     proxyReq: (proxyReq, req) => {
-      console.log(`[proxy] → ${req.method} ${TUNNEL_URL}${req.path}`);
+      // Inject the true client IP resolved by Render into a custom header
+      proxyReq.setHeader("x-original-ip", req.ip);
+      console.log(`[proxy] → ${req.method} ${TUNNEL_URL}${req.path} | IP: ${req.ip}`);
     },
     proxyRes: (proxyRes, req) => {
       console.log(`[proxy] ← ${proxyRes.statusCode} ${req.path}`);
