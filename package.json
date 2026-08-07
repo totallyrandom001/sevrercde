@@ -1,7 +1,7 @@
 {
   "name": "sopert-relay",
   "version": "1.0.0",
-  "description": "SOPERT relay — proxies GitHub Pages frontend to VAIO Tailscale Funnel",
+  "description": "SOPERT HOST",
   "main": "relay.js",
   "scripts": {
     "start": "node relay.js"
@@ -15,5 +15,6 @@
     "express-rate-limit": "^7.3.1",
     "http-proxy-middleware": "^2.0.6",
     "ws": "^8.17.1"
+    "@libsql/client": "^0.14.0"
   }
 }
