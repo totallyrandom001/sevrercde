@@ -123,7 +123,10 @@ const q = {
   deleteUserById:    async (id)            => db.execute({ sql: "DELETE FROM users WHERE rowid=?", args: [id] }),
   getUserById:       async (id)            => (await db.execute({ sql: "SELECT *,rowid FROM users WHERE rowid=?", args: [id] })).rows[0] || null,
   countUsers:        async ()              => (await db.execute("SELECT COUNT(*) as c FROM users")).rows[0],
-  getPending:        async ()              => (await db.execute("SELECT rowid as id, username FROM users WHERE status='pending' AND username NOT IN (SELECT DISTINCT sender FROM messages)")).rows,
+  getPending: async () => ({
+    pending: (await db.execute("SELECT username FROM users WHERE status = 'pending'")).rows.map(r => r.username),
+    accepted: (await db.execute("SELECT username FROM users WHERE status = 'approved' AND username NOT IN (SELECT DISTINCT sender FROM messages)")).rows.map(r => r.username)
+  }),
   getApproved:       async ()              => (await db.execute("SELECT username,role FROM users WHERE status='approved' AND username!='totally' AND username NOT IN (SELECT DISTINCT sender FROM messages)")).rows,
   getAdminUserList:  async ()              => (await db.execute("SELECT rowid as id,username,role,status FROM users WHERE status!='pending' AND username!='totally'")).rows,
 
