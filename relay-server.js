@@ -969,6 +969,9 @@ app.post("/api/messages/send", requireAuth, ah(async (req, res) => {
   const { groupToken, content, replyToSender, replyToContent } = req.body;
   const looksLikeImage = typeof content === "string" && content.startsWith("data:image/");
   const tokenResult = takeMessageToken(req.user.username);
+  if (groupToken === GRP_ANONSLAR && !ALLOWED_ANONS_SENDERS.includes(req.user.username)) {
+    return res.status(403).json({ error: "Bu gruba sadece yetkililer mesaj gönderebilir (Only authorized users can send messages here)" });
+  }
   if (!tokenResult.allowed) return res.status(429).json({ error: `Çok hızlı mesaj gönderiyorsunuz. ${tokenResult.waitSeconds} saniye bekleyin.` });
   if (!groupToken || typeof groupToken !== "string" || groupToken.length > 64) return res.status(400).json({ error: "Geçersiz grup tokenı" });
   if (!(await q.getMember(groupToken, req.user.username))) return res.status(403).json({ error: "Bu grubun üyesi değilsiniz" });
