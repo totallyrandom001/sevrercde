@@ -1038,38 +1038,28 @@ app.get("/api/admin/users", requireAuth, requireAdmin, ah(async (req, res) => {
   res.json(await q.getAdminUserList());
 }));
 
-app.post('/api/admin/action', async (req, res) => {
+app.post('/api/admin/action', requireAuth, requireAdmin, ah(async (req, res) => {
   const { id, action } = req.body;
-  // Ensure user is admin here...
 
   if (action === 'approve') {
-    try {
-      // 1. Get the username before or while updating the status
-      const [users] = await db.query(`SELECT username FROM users WHERE id = ?`, [id]);
-      if (!users.length) return res.status(404).json({ error: "User not found" });
-      const username = users[0].username;
+    // 1. Fetch user safely using your existing q helper
+    const user = await q.getUserById(id);
+    if (!user) return res.status(404).json({ error: "Kullanıcı bulunamadı" });
 
-      // 2. Update status to approved
-      await db.query(`UPDATE users SET status = 'approved' WHERE id = ?`, [id]);
+    // 2. Update status to approved using your existing helper
+    await q.updateUserStatus('approved', id);
 
-      // 3. Add to default system groups (use INSERT IGNORE to prevent duplicate errors)
-      const systemGroups = ['grp_everyone', 'grp_anonslar'];
-      for (const group of systemGroups) {
-        await db.query(
-          `INSERT IGNORE INTO group_members (group_token, username) VALUES (?, ?)`, 
-          [group, username]
-        );
-      }
+    // 3. Add to default system groups
+    await autoJoinDefaultGroups(user.username);
 
-      res.json({ success: true, message: "Kullanıcı onaylandı ve sistem gruplarına eklendi." });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Veritabanı hatası" });
-    }
+    res.json({ success: true, message: "Kullanıcı onaylandı ve sistem gruplarına eklendi." });
+    
   } else if (action === 'deny') {
-    // Handle denial (e.g., delete the user row or set status = 'denied')
+    // Delete the user row if denied
+    await q.deleteUserById(id);
+    res.json({ success: true, message: "Kullanıcı reddedildi ve silindi." });
   }
-});
+}));
 
 app.post("/api/admin/delete-user", requireAuth, requireAdmin, ah(async (req, res) => {
   const { username } = req.body;
