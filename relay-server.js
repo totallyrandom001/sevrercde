@@ -881,6 +881,9 @@ app.post("/api/groups/leave", requireAuth, ah(async (req, res) => {
   if (groupToken === GRP_ANONSLAR) {
     return res.status(403).json({ error: "Duyuru grubundan ayrılamazsınız (You cannot leave the announcements group)" });
   }
+  if (groupToken === GRP_EVERYONE) {
+    return res.status(403).json({ error: "Duyuru grubundan ayrılamazsınız (You cannot leave the announcements group)" });
+  }
   const before = await groupMemberUsernames(groupToken);
   if (before.length === 1) {
     await db.batch([
