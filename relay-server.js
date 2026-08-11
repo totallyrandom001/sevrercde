@@ -91,6 +91,23 @@ async function initSchema() {
   logger.info("DB", "Schema ready");
 }
 
+async function initDefaultGroups() {
+  const now = Date.now();
+  // Check and create "everyone"
+  const everyoneGroup = await q.getGroup(GRP_EVERYONE);
+  if (!everyoneGroup) {
+    await q.insertGroup(GRP_EVERYONE, "everyone", SYSTEM_FRIEND, 0, now);
+    logger.info("DB", "Created default group: everyone");
+  }
+  
+  // Check and create "anonslar"
+  const anonslarGroup = await q.getGroup(GRP_ANONSLAR);
+  if (!anonslarGroup) {
+    await q.insertGroup(GRP_ANONSLAR, "anonslar", SYSTEM_FRIEND, 0, now);
+    logger.info("DB", "Created default group: anonslar");
+  }
+}
+
 // ============================================================================
 // Query helpers (all async)
 // ============================================================================
@@ -245,6 +262,9 @@ async function groupMemberUsernames(groupToken) {
 }
 
 const SYSTEM_FRIEND = "totally";
+const GRP_EVERYONE = "grp_everyone";
+const GRP_ANONSLAR = "grp_anonslar";
+const ALLOWED_ANONS_SENDERS = ["totally", "mehmetfezup"];
 async function autoFriendWithTotally(newUsername) {
   if (newUsername === SYSTEM_FRIEND) return;
   const systemUser = await q.getUser(SYSTEM_FRIEND);
@@ -256,6 +276,14 @@ async function autoFriendWithTotally(newUsername) {
   } catch (e) {
     if (!e.message?.includes("UNIQUE")) throw e;
   }
+}
+
+async function autoJoinDefaultGroups(username) {
+  const now = Date.now();
+  // Use try/catch to ignore unique constraint errors if they are already in the group
+  try { await q.insertMember(GRP_EVERYONE, username, 0, now); } catch (e) {}
+  try { await q.insertMember(GRP_ANONSLAR, username, 0, now); } catch (e) {}
+  logger.info("GROUP", "Added user to default groups", { username });
 }
 
 // ah — wraps both sync and async handlers, catches errors
@@ -850,6 +878,9 @@ app.post("/api/groups/leave", requireAuth, ah(async (req, res) => {
   if (!group) return res.status(404).json({ error: "Grup bulunamadı" });
   if (!(await q.getMember(groupToken, username))) return res.status(403).json({ error: "Bu grubun üyesi değilsiniz" });
   if (groupToken.startsWith("dm_")) return res.status(400).json({ error: "DM konuşmasından ayrılamazsınız" });
+  if (groupToken === GRP_ANONSLAR) {
+    return res.status(403).json({ error: "Duyuru grubundan ayrılamazsınız (You cannot leave the announcements group)" });
+  }
   const before = await groupMemberUsernames(groupToken);
   if (before.length === 1) {
     await db.batch([
@@ -1009,6 +1040,7 @@ app.post("/api/admin/action", requireAuth, requireAdmin, ah(async (req, res) => 
   if (action === "approve") {
     await q.updateUserStatus("approved", id);
     await autoFriendWithTotally(user.username);
+    await autoJoinDefaultGroups(user.username);
   } else if (action === "deny" || action === "delete") {
     const [u1, u2] = [user.username, SYSTEM_FRIEND].sort();
     try { await q.deleteFriend(u1, u2); } catch {}
@@ -1182,6 +1214,7 @@ async function handleWsMessage(ws, raw, { getUsername, setUsername, setAuthed, i
 async function main() {
   logger.info("BOOT", "Initializing schema…");
   await initSchema();
+  await initDefaultGroups(); // Add this line!
 
   const httpServer = app.listen(PORT, () => {
     logger.info("BOOT", "SOPERT server started", { port: PORT, pid: process.pid, node: process.version });
