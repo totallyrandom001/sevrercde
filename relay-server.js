@@ -1088,12 +1088,32 @@ async function handleWsMessage(ws, raw, { getUsername, setUsername, setAuthed, i
   let frame;
   try { frame = JSON.parse(raw); } catch { return; }
 
-  if (!isAuthed()) {
-    if (frame.frameType !== "I-FRAME" || !frame.token) { ws.close(4001, "Expected I-FRAME"); return; }
-    if (isSuperadminSession(frame.token)) { ws.close(4003, "Not permitted"); return; }
+ if (!isAuthed()) {
+    if (frame.frameType !== "I-FRAME" || !frame.token) { 
+      sendFrame({ error: "Expected I-FRAME", status: 4001 });
+      ws.close(4001, "Expected I-FRAME"); 
+      return; 
+    }
+    if (isSuperadminSession(frame.token)) { 
+      sendFrame({ error: "Not permitted", status: 4003 });
+      ws.close(4003, "Not permitted"); 
+      return; 
+    }
+    
     const row = await q.getSessionRaw(frame.token);
-    if (!row || row.status !== "approved") { ws.close(4002, "Invalid session"); return; }
-    if (Date.now() - row.created_at > SESSION_TTL_MS) { ws.close(4002, "Session expired"); return; }
+    
+    // --- FIX: Send explicit 998 status frame before safely closing ---
+    if (!row || row.status !== "approved") { 
+      sendFrame({ error: "Geçersiz oturum", status: 998 });
+      ws.close(4002, "Invalid session"); 
+      return; 
+    }
+    if (Date.now() - row.created_at > SESSION_TTL_MS) { 
+      sendFrame({ error: "Geçersiz oturum", status: 998 });
+      ws.close(4002, "Session expired"); 
+      return; 
+    }
+    // -----------------------------------------------------------------
 
     const username = row.username;
     setUsername(username);
